@@ -9,37 +9,49 @@ import plotly.graph_objects as go
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from data_pipeline import (
-    ASTROS_ID,
+# ── Core shared utilities ─────────────────────────────────────────────────────
+from core.config import ASTROS_ID, STAR_BATTERS, PITCH_NAMES
+from core.headshots import headshot_b64
+from core.player_lookup import lookup_player_id, get_pitcher_handedness
+
+# ── MLB Live game pipeline ────────────────────────────────────────────────────
+from mlb_live.pipeline import (
     get_all_teams, get_todays_game, get_upcoming_game,
-    get_last_n_completed_games, get_live_box_score, get_linescore,
-    get_current_play, get_game_summary, build_inning_table,
-    build_batting_table, build_pitching_table, aggregate_batting_stats,
-    aggregate_pitching_stats, predict_lineup,
-    get_all_live_pitches, get_pitcher_live_pitches, compute_pitcher_fatigue,
-    get_win_probability_from_plays, get_batter_game_log, get_pitcher_game_log,
-    lookup_player_id,
-    get_pitcher_handedness, get_game_pitchers, get_active_pitcher,
+    get_live_box_score, get_linescore, get_current_play, get_game_summary,
+    build_inning_table, build_batting_table, build_pitching_table,
+    get_pitcher_live_pitches, compute_pitcher_fatigue,
+    get_win_probability_from_plays,
+    get_game_pitchers, get_active_pitcher,
+)
+from mlb_live.charts import (
+    plot_pitch_movement, plot_velocity_fade,
+    plot_fatigue_gauge, plot_win_probability,
+)
+
+# ── MLB Season stats pipeline ─────────────────────────────────────────────────
+from mlb_season.pipeline import (
+    get_last_n_completed_games, aggregate_batting_stats, aggregate_pitching_stats,
+    predict_lineup, get_batter_game_log, get_pitcher_game_log,
+    fetch_statcast_csv, get_pitcher_arsenal, get_batter_pitch_splits,
+    get_batter_hot_zones, get_barrel_trend,
     get_lineup_with_ids, get_team_pitching_staff, get_team_batting_leaders,
     get_league_avg_krate,
 )
-from nba_pipeline import (
+from mlb_season.charts import (
+    plot_matchup_heatmap, plot_hot_zone_grid,
+    plot_rolling_ops, plot_krate_chart, plot_barrel_trend,
+    show_pitch_mix_simulator,
+)
+
+# ── NBA Defensive Analytics ───────────────────────────────────────────────────
+from nba.pipeline import (
     get_all_player_metrics, get_team_aggregates,
     get_player_rolling_trend, get_play_sequence_stats,
 )
-from nba_charts import (
+from nba.charts import (
     plot_bubble_scatter, plot_leaderboard,
     plot_comparison_radar, plot_comparison_rolling, plot_team_bubbles,
     plot_steal_chain_sankey, plot_sequence_comparison,
-)
-from scouting import (
-    STAR_BATTERS, PITCH_NAMES,
-    fetch_statcast_csv, get_pitcher_arsenal, get_batter_pitch_splits,
-    get_batter_hot_zones, get_barrel_trend,
-    plot_matchup_heatmap, plot_hot_zone_grid, plot_pitch_movement,
-    plot_velocity_fade, plot_fatigue_gauge, plot_win_probability,
-    plot_rolling_ops, plot_krate_chart, plot_barrel_trend,
-    show_pitch_mix_simulator, headshot_url, headshot_b64,
 )
 
 CT = ZoneInfo("America/Chicago")
