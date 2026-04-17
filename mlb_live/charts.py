@@ -22,8 +22,20 @@ def _layout(**kwargs):
 
 def plot_pitch_movement(pitches: list[dict], pitcher_name: str = "") -> go.Figure:
     """
-    Horizontal (pfx_x) vs vertical (pfx_z) movement, colored by pitch type.
+    Horizontal (pfx_x) vs vertical induced break (pfx_z), colored by pitch type.
     One dot per pitch. Uses live game feed data.
+
+    Strike zone reference indicators:
+    • Vertical dashed lines at ±8.5" — half of the 17" wide plate.
+      Pitches that move more than 8.5" horizontally have shifted by a full
+      half-plate from their release point.
+    • Horizontal shaded band at +3" to +15" — typical range where fastball
+      rise keeps the ball in the top of the strike zone.
+    • Horizontal shaded band at -5" to -18" — typical range for breaking
+      balls to land at or below the bottom of the zone.
+    • Height reference note: exact batter-height-dependent boundaries are not
+      shown because vertical break is measured relative to spin-free trajectory,
+      not absolute pitch location.
     """
     if not pitches:
         return go.Figure(layout=go.Layout(title="No pitch data yet", **_layout()))
@@ -32,13 +44,73 @@ def plot_pitch_movement(pitches: list[dict], pitcher_name: str = "") -> go.Figur
     df = df[df["pfx_x"].notna() & df["pfx_z"].notna()] if "pfx_x" in df.columns else df
 
     fig = go.Figure()
+
+    # ── Strike zone reference overlays ───────────────────────────────────────
+    # Horizontal plate-edge reference lines at ±8.5" (half of 17")
+    HALF_PLATE = 8.5   # inches
+
+    # Shaded "effective zone" bands — fastball rise corridor
+    fig.add_shape(
+        type="rect",
+        x0=-25, x1=25, y0=3, y1=15,
+        fillcolor="rgba(46,204,113,0.06)",
+        line=dict(width=0),
+        layer="below",
+    )
+    # Shaded breaking-ball corridor
+    fig.add_shape(
+        type="rect",
+        x0=-25, x1=25, y0=-18, y1=-5,
+        fillcolor="rgba(52,152,219,0.06)",
+        line=dict(width=0),
+        layer="below",
+    )
+
+    # Plate-edge vertical references
+    for sign, label in [(-HALF_PLATE, "← Plate Edge"), (HALF_PLATE, "Plate Edge →")]:
+        fig.add_shape(
+            type="line",
+            xref="x", yref="paper",
+            x0=sign, x1=sign, y0=0, y1=1,
+            line=dict(color="rgba(255,255,255,0.22)", width=1.5, dash="dash"),
+        )
+        fig.add_annotation(
+            x=sign, y=1.01,
+            xref="x", yref="paper",
+            text=label,
+            showarrow=False,
+            font=dict(size=8, color="rgba(180,180,180,0.7)"),
+            xanchor="center",
+        )
+
+    # Corridor labels on y-axis
+    fig.add_annotation(
+        x=-24, y=9,
+        text="FB rise zone",
+        showarrow=False,
+        font=dict(size=8, color="rgba(46,204,113,0.55)"),
+        xanchor="left",
+    )
+    fig.add_annotation(
+        x=-24, y=-11.5,
+        text="Breaking zone",
+        showarrow=False,
+        font=dict(size=8, color="rgba(52,152,219,0.55)"),
+        xanchor="left",
+    )
+
+    # Cross-hair at origin
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.3)")
+    fig.add_vline(x=0, line_dash="dot", line_color="rgba(255,255,255,0.3)")
+
+    # ── One trace per pitch type ──────────────────────────────────────────────
     for pt, g in df.groupby("pitch_type"):
         color = PITCH_COLORS.get(pt, "#cccccc")
         name  = PITCH_NAMES.get(pt, pt)
-        # pfx_x / pfx_z come from live API in feet * 12 (inches in some cases)
-        # Normalize: if max abs > 5, they're in inches → divide by 12
-        px_vals = g["pfx_x"] * (1 if g["pfx_x"].abs().max() <= 5 else 1/12)
-        pz_vals = g["pfx_z"] * (1 if g["pfx_z"].abs().max() <= 5 else 1/12)
+        # pfx_x / pfx_z come from live API in feet; Statcast in inches.
+        # Normalize: if max abs > 5, already in inches; else multiply by 12.
+        px_vals = g["pfx_x"] * (1 if g["pfx_x"].abs().max() > 5 else 12)
+        pz_vals = g["pfx_z"] * (1 if g["pfx_z"].abs().max() > 5 else 12)
         speeds  = g["speed"].fillna(0) if "speed" in g.columns else pd.Series([0]*len(g))
         fig.add_trace(go.Scatter(
             x=px_vals, y=pz_vals,
@@ -46,18 +118,29 @@ def plot_pitch_movement(pitches: list[dict], pitcher_name: str = "") -> go.Figur
             marker=dict(size=7, color=color,
                         line=dict(color="white", width=0.4), opacity=0.85),
             name=f"{name} (n={len(g)})",
-            hovertemplate=f"<b>{name}</b><br>HB: %{{x:.1f}} in<br>VB: %{{y:.1f}} in<br>Velo: %{{customdata:.1f}}<extra></extra>",
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "HBreak: %{x:.1f}″<br>VBreak: %{y:.1f}″<br>"
+                "Velo: %{customdata:.1f} mph<extra></extra>"
+            ),
             customdata=speeds,
         ))
 
-    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.3)")
-    fig.add_vline(x=0, line_dash="dot", line_color="rgba(255,255,255,0.3)")
     fig.update_layout(
-        title=f"Pitch Movement — {pitcher_name}",
-        xaxis=dict(title="Horizontal Break (in, catcher's view)", showgrid=False),
-        yaxis=dict(title="Vertical Break (in)", showgrid=False, scaleanchor="x", scaleratio=1),
-        height=430,
-        **_layout(margin=dict(l=60, r=160, t=55, b=50)),
+        title=f"Pitch Movement — {pitcher_name}  "
+              f"<span style='font-size:11px;color:#888'>"
+              f"Break vs spin-free trajectory (dashed = ½ plate = 8.5″)</span>",
+        xaxis=dict(
+            title="Horizontal Break (in, catcher's view +right)",
+            showgrid=False, range=[-25, 25],
+        ),
+        yaxis=dict(
+            title="Vertical Induced Break (in, +up)",
+            showgrid=False, range=[-22, 22],
+            scaleanchor="x", scaleratio=1,
+        ),
+        height=480,
+        **_layout(margin=dict(l=60, r=160, t=70, b=50)),
     )
     return fig
 
