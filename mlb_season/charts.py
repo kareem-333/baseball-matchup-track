@@ -449,3 +449,258 @@ def show_pitch_mix_simulator(
     if not danger.empty:
         st.markdown("**⚡ High-Risk Matchups** (adj barrel% > 8%)")
         st.dataframe(danger.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+
+# ── 7. Career pitch-type split overview ──────────────────────────────────────
+
+_STAT_META: list[dict] = [
+    {"col": "whiff_rate",    "label": "Whiff%",     "color": "#e74c3c", "hi_bad": True,  "fmt": ".1f", "suffix": "%"},
+    {"col": "k_rate",        "label": "K%",          "color": "#e67e22", "hi_bad": True,  "fmt": ".1f", "suffix": "%"},
+    {"col": "barrel_rate",   "label": "Barrel%",     "color": "#f1c40f", "hi_bad": False, "fmt": ".1f", "suffix": "%"},
+    {"col": "hard_hit_rate", "label": "Hard Hit%",   "color": "#2ecc71", "hi_bad": False, "fmt": ".1f", "suffix": "%"},
+    {"col": "avg_ev",        "label": "Avg EV",      "color": "#3498db", "hi_bad": False, "fmt": ".1f", "suffix": " mph"},
+    {"col": "xba",           "label": "xBA",         "color": "#9b59b6", "hi_bad": False, "fmt": ".3f", "suffix": ""},
+    {"col": "xwoba",         "label": "xwOBA",       "color": "#1abc9c", "hi_bad": False, "fmt": ".3f", "suffix": ""},
+]
+
+
+def plot_career_pitch_splits(career_df: pd.DataFrame, batter_name: str) -> go.Figure:
+    """
+    Grouped bar chart — one group per pitch type, one bar per metric.
+    Shows career aggregated pitch-type split stats for a batter.
+    All metrics are normalized to [0,1] across pitch types for comparability,
+    with the actual value shown in the hover tooltip.
+    """
+    if career_df.empty:
+        return go.Figure(layout=go.Layout(title=f"No career data for {batter_name}", **_layout()))
+
+    df = career_df.copy()
+    pitch_types = df["pitch_name"].tolist()
+    n_groups    = len(pitch_types)
+
+    fig = go.Figure()
+
+    for meta in _STAT_META:
+        col = meta["col"]
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce")
+        if vals.isna().all():
+            continue
+
+        # Normalize 0→1 for visual comparison; keep raw for tooltip
+        v_min, v_max = vals.min(), vals.max()
+        norm = (vals - v_min) / (v_max - v_min + 1e-9)
+
+        # Invert bad-is-high metrics so green = good across the board
+        if meta["hi_bad"]:
+            norm = 1 - norm
+
+        hover = [
+            f"<b>{pitch_types[i]}</b><br>{meta['label']}: "
+            + (f"{v:{meta['fmt']}}{meta['suffix']}" if not np.isnan(v) else "N/A")
+            for i, v in enumerate(vals)
+        ]
+
+        fig.add_trace(go.Bar(
+            name=meta["label"],
+            x=pitch_types,
+            y=norm.fillna(0),
+            marker_color=meta["color"],
+            opacity=0.82,
+            hovertemplate="%{customdata}<extra></extra>",
+            customdata=hover,
+            text=[
+                f"{v:{meta['fmt']}}{meta['suffix']}" if not np.isnan(v) else ""
+                for v in vals
+            ],
+            textposition="outside",
+            textfont=dict(size=8),
+        ))
+
+    fig.update_layout(
+        barmode="group",
+        title=f"Career Pitch-Type Profile — {batter_name}",
+        xaxis=dict(title="Pitch Type", showgrid=False),
+        yaxis=dict(
+            title="Relative Score (normalized per metric)",
+            showgrid=False, showticklabels=False,
+            range=[0, 1.25],
+        ),
+        height=400,
+        legend=dict(orientation="h", x=0, y=1.08, font=dict(size=9)),
+        **_layout(margin=dict(l=50, r=20, t=75, b=60)),
+    )
+    return fig
+
+
+def plot_pitch_type_season_trend(
+    by_season_df: pd.DataFrame,
+    pitch_type_name: str,
+    batter_name: str,
+) -> go.Figure:
+    """
+    Year-over-year line chart for a specific pitch type.
+    Shows whiff%, barrel%, xBA, and (if available) xwOBA across seasons.
+    """
+    if by_season_df.empty:
+        return go.Figure(layout=go.Layout(
+            title=f"No season data for {batter_name} vs {pitch_type_name}", **_layout()))
+
+    df = by_season_df[by_season_df["pitch_name"] == pitch_type_name].copy()
+    if df.empty or df["season"].nunique() < 2:
+        return go.Figure(layout=go.Layout(
+            title=f"Insufficient seasons for {pitch_type_name} trend", **_layout()))
+
+    df = df.sort_values("season")
+    seasons = df["season"].astype(str).tolist()
+
+    fig = go.Figure()
+
+    trend_metrics = [
+        ("whiff_rate",  "Whiff%",   "#e74c3c", "y",  ".1f", "%"),
+        ("barrel_rate", "Barrel%",  "#f1c40f", "y",  ".1f", "%"),
+        ("xba",         "xBA",      "#9b59b6", "y2", ".3f", ""),
+        ("xwoba",       "xwOBA",    "#1abc9c", "y2", ".3f", ""),
+    ]
+
+    for col, label, color, yax, fmt, suf in trend_metrics:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce")
+        if vals.isna().all():
+            continue
+
+        hover = [
+            f"<b>{s}</b><br>{label}: {f'{v:{fmt}}{suf}' if not np.isnan(v) else 'N/A'}"
+            for s, v in zip(seasons, vals)
+        ]
+
+        fig.add_trace(go.Scatter(
+            x=seasons, y=vals,
+            mode="lines+markers",
+            line=dict(color=color, width=2),
+            marker=dict(size=8, symbol="circle"),
+            name=label,
+            yaxis=yax,
+            hovertemplate="%{customdata}<extra></extra>",
+            customdata=hover,
+            connectgaps=True,
+        ))
+
+    # Pitches-seen bar (secondary context)
+    if "pitches" in df.columns:
+        fig.add_trace(go.Bar(
+            x=seasons, y=df["pitches"],
+            name="Pitches seen",
+            marker_color="rgba(180,180,180,0.18)",
+            yaxis="y3",
+            hovertemplate="<b>%{x}</b><br>Pitches: %{y}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=f"{batter_name} vs {pitch_type_name} — Season-by-Season Trend",
+        xaxis=dict(title="Season", showgrid=False),
+        yaxis=dict(title="Rate (%)", side="left",  showgrid=False),
+        yaxis2=dict(title="Expected Stat", side="right", overlaying="y",
+                    showgrid=False, tickformat=".3f"),
+        yaxis3=dict(overlaying="y", side="right", showgrid=False,
+                    showticklabels=False, range=[0, df["pitches"].max() * 5]
+                    if "pitches" in df.columns else None),
+        legend=dict(orientation="h", x=0, y=1.1, font=dict(size=9)),
+        height=340,
+        **_layout(margin=dict(l=60, r=70, t=70, b=50)),
+    )
+    return fig
+
+
+def plot_career_splits_table_fig(career_df: pd.DataFrame, batter_name: str) -> go.Figure:
+    """
+    Colour-coded table of career pitch-type stats.
+    Each cell is coloured by percentile within its column (green = good for batter).
+    """
+    if career_df.empty:
+        return go.Figure(layout=go.Layout(title=f"No data for {batter_name}", **_layout()))
+
+    display_cols = ["pitch_name", "pitches", "whiff_rate", "k_rate",
+                    "barrel_rate", "hard_hit_rate", "avg_ev", "xba", "xwoba"]
+    col_labels   = ["Pitch", "Pitches", "Whiff%", "K%",
+                    "Barrel%", "Hard Hit%", "Avg EV", "xBA", "xwOBA"]
+    hi_bad_cols  = {"whiff_rate", "k_rate"}
+
+    df = career_df[[c for c in display_cols if c in career_df.columns]].copy()
+
+    cell_colors: list[list[str]] = []
+    cell_texts:  list[list[str]] = []
+
+    for i, col in enumerate(df.columns):
+        col_texts  = []
+        col_colors = []
+
+        if col == "pitch_name":
+            for v in df[col]:
+                col_texts.append(str(v))
+                col_colors.append("rgba(20,30,50,0.9)")
+            cell_texts.append(col_texts)
+            cell_colors.append(col_colors)
+            continue
+
+        vals = pd.to_numeric(df[col], errors="coerce")
+        v_min, v_max = vals.min(), vals.max()
+
+        for v in vals:
+            if np.isnan(v):
+                col_texts.append("—")
+                col_colors.append("rgba(20,30,50,0.9)")
+                continue
+
+            # Format
+            meta_match = next((m for m in _STAT_META if m["col"] == col), None)
+            if meta_match:
+                fmt, suf = meta_match["fmt"], meta_match["suffix"]
+                col_texts.append(f"{v:{fmt}}{suf}")
+            elif col in ("pitches", "bip"):
+                col_texts.append(str(int(v)))
+            else:
+                col_texts.append(f"{v:.2f}")
+
+            # Color: percentile-based (0=worst,1=best for batter)
+            pct = (v - v_min) / (v_max - v_min + 1e-9)
+            if col in hi_bad_cols:
+                pct = 1 - pct   # invert: lower = better
+            r = int(255 * (1 - pct) * 0.6 + 10)
+            g_val = int(255 * pct * 0.7 + 20)
+            b_val = int(40)
+            col_colors.append(f"rgba({r},{g_val},{b_val},0.75)")
+
+        cell_texts.append(col_texts)
+        cell_colors.append(col_colors)
+
+    actual_labels = col_labels[:len(df.columns)]
+
+    fig = go.Figure(go.Table(
+        header=dict(
+            values=[f"<b>{l}</b>" for l in actual_labels],
+            fill_color="rgba(30,50,80,0.95)",
+            align="center",
+            font=dict(color="white", size=11),
+            line_color="rgba(255,255,255,0.1)",
+            height=32,
+        ),
+        cells=dict(
+            values=cell_texts,
+            fill_color=cell_colors,
+            align=["left"] + ["center"] * (len(df.columns) - 1),
+            font=dict(color="white", size=10),
+            line_color="rgba(255,255,255,0.06)",
+            height=28,
+        ),
+    ))
+    fig.update_layout(
+        title=f"Career Pitch-Type Stats — {batter_name}  "
+              f"<span style='font-size:10px;color:#888'>"
+              f"(green = favorable for batter)</span>",
+        height=max(200, 32 + 28 * len(df) + 60),
+        **_layout(margin=dict(l=10, r=10, t=55, b=10)),
+    )
+    return fig

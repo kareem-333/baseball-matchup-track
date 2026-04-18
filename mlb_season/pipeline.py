@@ -14,7 +14,11 @@ from io import StringIO
 from datetime import date, timedelta
 from collections import defaultdict, Counter
 
-from core.config import ASTROS_ID
+from core.config import ASTROS_ID, PITCH_NAMES
+
+_CURRENT_SEASON = date.today().year
+# Default career window — last 3 full seasons + current
+_CAREER_SEASONS = list(range(_CURRENT_SEASON - 3, _CURRENT_SEASON + 1))
 
 _SAVANT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -139,6 +143,175 @@ def get_batter_pitch_splits(batter_id: int) -> pd.DataFrame:
         })
     df_out = pd.DataFrame(rows)
     return df_out[df_out["pitches"] >= 10].sort_values("pitches", ascending=False)
+
+
+# ── Multi-season Statcast fetch ───────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_statcast_multi_season(
+    player_id: int,
+    player_type: str,
+    seasons: tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch and concatenate Statcast pitch-level data across multiple seasons.
+
+    seasons: tuple of ints, e.g. (2022, 2023, 2024, 2025).
+             Defaults to the last 3 full seasons + current year.
+    player_type: 'batter' or 'pitcher'.
+
+    Returns a single DataFrame with a 'season' column added.
+    Seasons with no data are silently skipped.
+    """
+    if seasons is None:
+        cur = date.today().year
+        seasons = tuple(range(cur - 3, cur + 1))
+
+    frames = []
+    for yr in seasons:
+        df = fetch_statcast_csv(player_id, player_type, yr)
+        if not df.empty:
+            df = df.copy()
+            df["season"] = yr
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    # Ensure season is int
+    combined["season"] = combined["season"].astype(int)
+    return combined
+
+
+# ── Career batter pitch-type splits ──────────────────────────────────────────
+
+def _whiff_rate(g: pd.DataFrame) -> float:
+    """Swinging strikes / total swings (swing = S or contact on swing)."""
+    if "description" not in g.columns:
+        return np.nan
+    swings = g["description"].isin([
+        "swinging_strike", "swinging_strike_blocked", "foul",
+        "foul_tip", "foul_bunt", "missed_bunt",
+        "hit_into_play", "hit_into_play_score", "hit_into_play_no_out",
+    ])
+    whiffs = g["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+    n_swings = swings.sum()
+    return float(whiffs.sum() / n_swings * 100) if n_swings >= 5 else np.nan
+
+
+def _hard_hit_rate(bip: pd.DataFrame) -> float:
+    """BIP with exit velo >= 95 mph / total BIP."""
+    if "launch_speed" not in bip.columns or len(bip) < 5:
+        return np.nan
+    ev = pd.to_numeric(bip["launch_speed"], errors="coerce").dropna()
+    if len(ev) < 5:
+        return np.nan
+    return float((ev >= 95).sum() / len(ev) * 100)
+
+
+def _avg_ev(bip: pd.DataFrame) -> float:
+    if "launch_speed" not in bip.columns:
+        return np.nan
+    ev = pd.to_numeric(bip["launch_speed"], errors="coerce").dropna()
+    return float(ev.mean()) if len(ev) >= 3 else np.nan
+
+
+def _xwoba(g: pd.DataFrame) -> float:
+    col = "estimated_woba_using_speedangle"
+    if col not in g.columns:
+        return np.nan
+    vals = pd.to_numeric(g[col], errors="coerce").dropna()
+    return float(vals.mean()) if len(vals) >= 5 else np.nan
+
+
+def _k_rate_from_events(g: pd.DataFrame) -> float:
+    """Strikeout rate per plate appearance (events = 'strikeout' on last pitch of PA)."""
+    if "events" not in g.columns:
+        return np.nan
+    pa_rows = g[g["events"].notna() & (g["events"] != "")]
+    if len(pa_rows) < 5:
+        return np.nan
+    ks = (pa_rows["events"] == "strikeout").sum()
+    return float(ks / len(pa_rows) * 100)
+
+
+def _splits_for_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per-pitch-type stats from a Statcast DataFrame.
+    Returns rows with columns: pitch_type, pitch_name, pitches, bip,
+    whiff_rate, k_rate, barrel_rate, hard_hit_rate, avg_ev, xba, xwoba.
+    """
+    df = df[df["pitch_type"].notna() & (df["pitch_type"] != "")].copy()
+    rows = []
+    total = len(df)
+    for pt, g in df.groupby("pitch_type"):
+        bip = g[g["type"] == "X"].copy() if "type" in g.columns else g.copy()
+        n_bip = len(bip)
+        barrels = 0
+        if "launch_speed_angle" in bip.columns and n_bip >= 3:
+            barrels = (pd.to_numeric(bip["launch_speed_angle"], errors="coerce") == 6).sum()
+        xba_col = "estimated_ba_using_speedangle"
+        xba_vals = pd.to_numeric(bip[xba_col], errors="coerce").dropna() if xba_col in bip.columns else pd.Series(dtype=float)
+
+        rows.append({
+            "pitch_type":    pt,
+            "pitch_name":    PITCH_NAMES.get(pt, g["pitch_name"].iloc[0] if "pitch_name" in g.columns else pt),
+            "pitches":       len(g),
+            "usage_pct":     round(len(g) / total * 100, 1) if total > 0 else 0.0,
+            "bip":           n_bip,
+            "whiff_rate":    _whiff_rate(g),
+            "k_rate":        _k_rate_from_events(g),
+            "barrel_rate":   float(barrels / n_bip * 100) if n_bip >= 5 else np.nan,
+            "hard_hit_rate": _hard_hit_rate(bip),
+            "avg_ev":        _avg_ev(bip),
+            "xba":           float(xba_vals.mean()) if len(xba_vals) >= 3 else np.nan,
+            "xwoba":         _xwoba(g),
+        })
+
+    out = pd.DataFrame(rows)
+    return out[out["pitches"] >= 10].sort_values("pitches", ascending=False) if not out.empty else out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_batter_career_pitch_splits(
+    batter_id: int,
+    seasons: tuple[int, ...] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return career-level and season-by-season pitch-type split stats for a batter.
+
+    Returns:
+        career_df    — one row per pitch type, aggregated across all seasons
+        by_season_df — one row per (season, pitch_type), for trend charts
+
+    Both DataFrames carry the same stats columns:
+        pitch_type, pitch_name, pitches, usage_pct, bip,
+        whiff_rate, k_rate, barrel_rate, hard_hit_rate, avg_ev, xba, xwoba
+    """
+    if seasons is None:
+        cur = date.today().year
+        seasons = tuple(range(cur - 3, cur + 1))
+
+    combined = fetch_statcast_multi_season(batter_id, "batter", seasons)
+    if combined.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # ── Career aggregate ──────────────────────────────────────────────────────
+    career_df = _splits_for_df(combined)
+    if not career_df.empty:
+        career_df.insert(0, "season", "Career")
+
+    # ── Season-by-season breakdown ────────────────────────────────────────────
+    season_rows = []
+    for yr in sorted(combined["season"].unique()):
+        yr_df = combined[combined["season"] == yr]
+        splits = _splits_for_df(yr_df)
+        if not splits.empty:
+            splits.insert(0, "season", int(yr))
+            season_rows.append(splits)
+
+    by_season_df = pd.concat(season_rows, ignore_index=True) if season_rows else pd.DataFrame()
+
+    return career_df, by_season_df
 
 
 # ── Batter hot zones ──────────────────────────────────────────────────────────

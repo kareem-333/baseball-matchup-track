@@ -33,6 +33,7 @@ from mlb_season.pipeline import (
     get_last_n_completed_games, aggregate_batting_stats, aggregate_pitching_stats,
     predict_lineup, get_batter_game_log, get_pitcher_game_log,
     fetch_statcast_csv, get_pitcher_arsenal, get_batter_pitch_splits,
+    get_batter_career_pitch_splits,
     get_batter_hot_zones, get_barrel_trend,
     get_lineup_with_ids, get_team_pitching_staff, get_team_batting_leaders,
     get_league_avg_krate,
@@ -41,6 +42,8 @@ from mlb_season.charts import (
     plot_matchup_heatmap, plot_hot_zone_grid,
     plot_rolling_ops, plot_krate_chart, plot_barrel_trend,
     show_pitch_mix_simulator,
+    plot_career_pitch_splits, plot_pitch_type_season_trend,
+    plot_career_splits_table_fig,
 )
 
 # ── NBA Defensive Analytics ───────────────────────────────────────────────────
@@ -488,6 +491,125 @@ with tab_scout:
                 "that is expected, as sliders start at the pitcher's actual usage rates."
             )
             show_pitch_mix_simulator(batters_splits, pitcher_arsenal, key_prefix="sim")
+
+        # ── Career / multi-season pitch-type splits ───────────────────────────
+        st.markdown("---")
+        with st.expander("📊 Career Pitch-Type Splits — larger sample size", expanded=False):
+            st.markdown(
+                "Aggregates Statcast data across multiple seasons so you can see how "
+                "a batter *actually* performs against each pitch type over a bigger sample. "
+                "Great for spotting weaknesses like **Ohtani vs sliders** or "
+                "**Freeman vs breaking balls**."
+            )
+
+            import datetime as _dt_career
+            _cur_yr = _dt_career.date.today().year
+
+            # Season range selector
+            career_col1, career_col2 = st.columns([2, 1])
+            with career_col1:
+                avail_seasons = list(range(_cur_yr - 4, _cur_yr + 1))
+                sel_seasons   = st.multiselect(
+                    "Seasons to include",
+                    avail_seasons,
+                    default=[_cur_yr - 2, _cur_yr - 1, _cur_yr],
+                    key=f"career_seasons_{team_id}",
+                )
+            with career_col2:
+                career_batter = st.selectbox(
+                    "Batter to analyse",
+                    list(batter_ids.keys()) if batter_ids else list(STAR_BATTERS.keys()),
+                    key=f"career_batter_{team_id}",
+                )
+
+            if not sel_seasons:
+                st.warning("Select at least one season.")
+            else:
+                # Look up ID — box score first, then STAR_BATTERS, then name lookup
+                career_bid = (
+                    batter_ids.get(career_batter)
+                    or STAR_BATTERS.get(career_batter)
+                    or lookup_player_id(career_batter)
+                )
+                if not career_bid:
+                    st.warning(f"Could not resolve player ID for **{career_batter}**.")
+                else:
+                    seasons_tuple = tuple(sorted(sel_seasons))
+                    season_label  = (
+                        f"{seasons_tuple[0]}–{seasons_tuple[-1]}"
+                        if len(seasons_tuple) > 1 else str(seasons_tuple[0])
+                    )
+                    with st.spinner(
+                        f"Fetching {season_label} Statcast data for {career_batter}…"
+                    ):
+                        career_df, by_season_df = get_batter_career_pitch_splits(
+                            career_bid, seasons=seasons_tuple
+                        )
+
+                    if career_df.empty:
+                        st.info(
+                            f"No Statcast data found for {career_batter} "
+                            f"in seasons {seasons_tuple}."
+                        )
+                    else:
+                        total_pitches = career_df["pitches"].sum() if "pitches" in career_df.columns else 0
+                        st.caption(
+                            f"**{career_batter}** · {season_label} · "
+                            f"{total_pitches:,} total pitches across "
+                            f"{len(career_df)} pitch types"
+                        )
+
+                        # ── Colour-coded stats table ──────────────────────────
+                        tbl_fig = plot_career_splits_table_fig(career_df, career_batter)
+                        st.plotly_chart(tbl_fig, use_container_width=True)
+
+                        # ── Grouped bar overview ──────────────────────────────
+                        bar_fig = plot_career_pitch_splits(career_df, career_batter)
+                        st.plotly_chart(bar_fig, use_container_width=True)
+
+                        # ── Per-pitch-type deep dive (season-by-season) ───────
+                        if not by_season_df.empty and by_season_df["season"].nunique() >= 2:
+                            st.markdown("#### Year-over-Year Trend by Pitch Type")
+                            pitch_name_options = career_df["pitch_name"].tolist()
+                            dive_pitch = st.selectbox(
+                                "Select pitch type for season-by-season breakdown",
+                                pitch_name_options,
+                                key=f"career_dive_pitch_{team_id}_{career_batter}",
+                            )
+                            if dive_pitch:
+                                trend_fig = plot_pitch_type_season_trend(
+                                    by_season_df, dive_pitch, career_batter
+                                )
+                                st.plotly_chart(trend_fig, use_container_width=True)
+
+                                # Raw numbers table
+                                dive_rows = by_season_df[
+                                    by_season_df["pitch_name"] == dive_pitch
+                                ].sort_values("season")
+                                if not dive_rows.empty:
+                                    show_cols = [c for c in [
+                                        "season", "pitches", "whiff_rate", "k_rate",
+                                        "barrel_rate", "hard_hit_rate", "avg_ev", "xba", "xwoba"
+                                    ] if c in dive_rows.columns]
+                                    st.dataframe(
+                                        dive_rows[show_cols].rename(columns={
+                                            "season": "Season",
+                                            "pitches": "Pitches",
+                                            "whiff_rate": "Whiff%",
+                                            "k_rate": "K%",
+                                            "barrel_rate": "Barrel%",
+                                            "hard_hit_rate": "Hard Hit%",
+                                            "avg_ev": "Avg EV",
+                                            "xba": "xBA",
+                                            "xwoba": "xwOBA",
+                                        }).round(3),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                        elif not by_season_df.empty:
+                            st.caption(
+                                "Select 2+ seasons above to enable year-over-year trend view."
+                            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
