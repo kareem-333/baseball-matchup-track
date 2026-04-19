@@ -14,7 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from mlb_season.pipeline import PITCH_LABELS, _season_start_str, _today_str
+from mlb_season.pipeline import PITCH_LABELS
 
 
 # ── colour palette ────────────────────────────────────────────────────────────
@@ -106,14 +106,12 @@ def plot_hot_zone_grid(batter_id: int, season: int | None = None) -> go.Figure:
         (0,1) (1,1) (2,1)   ← middle
         (0,0) (1,0) (2,0)   ← bottom
     """
-    from pybaseball import statcast_batter
+    from mlb_season.pipeline import fetch_statcast_csv
 
     season = season or date.today().year
-    start = _season_start_str(season)
-    end = _today_str()
 
     try:
-        df = statcast_batter(start, end, batter_id)
+        df = fetch_statcast_csv(batter_id, "batter", season)
     except Exception:
         df = pd.DataFrame()
 
