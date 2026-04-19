@@ -107,6 +107,11 @@ from mlb_season.pipeline import (
     get_pitcher_arsenal,
     get_batter_pitch_splits,
     get_batter_career_pitch_splits,
+    get_batter_game_log,
+    get_pitcher_game_log,
+    get_last_n_completed_games,
+    aggregate_batting_stats,
+    aggregate_pitching_stats,
     get_team_batting_leaders,
     get_player_headshot_url,
 )
@@ -518,7 +523,9 @@ with tab_trends:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_history:
-    st.markdown("### Season Splits — Batter")
+
+    # ── Batter section ────────────────────────────────────────────────────────
+    st.markdown("### Batter History")
     batter_search = st.text_input(
         "Search batter", placeholder="e.g. Yordan Alvarez", key="hist_batter"
     )
@@ -526,41 +533,131 @@ with tab_history:
         hist_results = search_players(batter_search)
         non_p = [r for r in hist_results if r["position"] not in ("P", "SP", "RP")]
         if non_p:
-            labels  = [f"{r['full_name']} — {r['team']}" for r in non_p]
-            chosen  = st.selectbox("Select batter", labels, key="hist_batter_sel")
-            bid     = non_p[labels.index(chosen)]["player_id"]
-            splits  = get_batter_pitch_splits(bid)
-            if not splits.empty:
-                disp = splits[["pitch_label","vs_hand","barrel_rate","whiff_rate","sample_size"]].copy()
-                disp["barrel_rate"] = (disp["barrel_rate"]*100).round(2).astype(str)+"%"
-                disp["whiff_rate"]  = (disp["whiff_rate"]*100).round(2).astype(str)+"%"
-                disp.columns = ["Pitch","vs Hand","Barrel %","Whiff %","Pitches Seen"]
-                st.dataframe(disp, use_container_width=True, hide_index=True)
-                st.plotly_chart(plot_career_pitch_splits(bid), use_container_width=True, key="hist_cs")
-            else:
-                st.info("No split data found for this batter this season.")
+            labels = [f"{r['full_name']} — {r['team']}" for r in non_p]
+            chosen = st.selectbox("Select batter", labels, key="hist_batter_sel")
+            bid    = non_p[labels.index(chosen)]["player_id"]
+
+            htab1, htab2, htab3 = st.tabs(["Game Log", "Pitch Splits", "Split Chart"])
+
+            with htab1:
+                st.markdown("#### Game-by-Game Log (current season)")
+                log = get_batter_game_log(bid)
+                if not log.empty:
+                    disp = log[["game_date","ab","hits","hr","k","pitches","avg"]].copy()
+                    disp.columns = ["Date","AB","H","HR","K","Pitches","AVG"]
+                    st.dataframe(disp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No game log data available for this season.")
+
+            with htab2:
+                st.markdown("#### Season Pitch-Type Splits (vs LHP / RHP)")
+                splits = get_batter_pitch_splits(bid)
+                if not splits.empty:
+                    disp = splits[["pitch_label","vs_hand","barrel_rate","whiff_rate","sample_size"]].copy()
+                    disp["barrel_rate"] = (disp["barrel_rate"]*100).round(2).astype(str)+"%"
+                    disp["whiff_rate"]  = (disp["whiff_rate"]*100).round(2).astype(str)+"%"
+                    disp.columns = ["Pitch","vs Hand","Barrel %","Whiff %","Pitches Seen"]
+                    st.dataframe(disp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No split data found for this batter this season.")
+
+            with htab3:
+                st.plotly_chart(
+                    plot_career_pitch_splits(bid),
+                    use_container_width=True, key="hist_cs"
+                )
         else:
             st.warning("No position players found.")
 
     st.markdown("---")
-    st.markdown("### Season Arsenal — Pitcher")
+
+    # ── Team Last-3 section ───────────────────────────────────────────────────
+    st.markdown("### Last 3 Games — Team Stats")
+    team_search_l3 = st.text_input(
+        "Search team", placeholder="e.g. Houston Astros", key="hist_team"
+    )
+    if team_search_l3:
+        try:
+            all_teams = get_all_teams()
+            matched = [t for t in all_teams if team_search_l3.lower() in t["name"].lower()]
+            if matched:
+                team_labels = [t["name"] for t in matched]
+                chosen_team = st.selectbox("Select team", team_labels, key="hist_team_sel")
+                team_id = next(t["id"] for t in matched if t["name"] == chosen_team)
+
+                with st.spinner("Loading last 3 games…"):
+                    recent_games = get_last_n_completed_games(team_id, n=3)
+                    game_ids     = [g["game_id"] for g in recent_games]
+
+                if not recent_games:
+                    st.info("No completed games found in the last 30 days.")
+                else:
+                    for g in recent_games:
+                        st.markdown(
+                            f"✅ **{g['game_date']}** — {g['away_name']} @ {g['home_name']}  "
+                            f"({g.get('away_score','')}–{g.get('home_score','')})"
+                        )
+
+                    col_bat, col_pit = st.columns(2)
+                    with col_bat:
+                        st.markdown("#### Batting (L3 combined)")
+                        bat_stats = aggregate_batting_stats(game_ids, team_id)
+                        if not bat_stats.empty:
+                            disp = bat_stats[["name","ab","hits","hr","rbi","k","avg"]].copy()
+                            disp.columns = ["Player","AB","H","HR","RBI","K","AVG"]
+                            st.dataframe(disp, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No batting data.")
+
+                    with col_pit:
+                        st.markdown("#### Pitching (L3 combined)")
+                        pit_stats = aggregate_pitching_stats(game_ids, team_id)
+                        if not pit_stats.empty:
+                            disp = pit_stats[["name","ip","k","bb","er","hits"]].copy()
+                            disp.columns = ["Pitcher","IP","K","BB","ER","H"]
+                            st.dataframe(disp, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No pitching data.")
+            else:
+                st.warning("No team found. Try the full team name, e.g. 'Houston Astros'.")
+        except Exception as e:
+            st.error(f"Error loading team data: {e}")
+
+    st.markdown("---")
+
+    # ── Pitcher section ───────────────────────────────────────────────────────
+    st.markdown("### Pitcher History")
     pitcher_hist = st.text_input(
-        "Search pitcher", placeholder="e.g. Gerrit Cole", key="hist_pitcher"
+        "Search pitcher", placeholder="e.g. Lance McCullers Jr.", key="hist_pitcher"
     )
     if pitcher_hist:
         pit_results = search_players(pitcher_hist)
         pitchers    = [r for r in pit_results if r["position"] in ("P","SP","RP")]
         if pitchers:
-            labels   = [f"{r['full_name']} — {r['team']}" for r in pitchers]
-            chosen   = st.selectbox("Select pitcher", labels, key="hist_pitcher_sel")
-            pid      = pitchers[labels.index(chosen)]["player_id"]
-            arsenal  = get_pitcher_arsenal(pid)
-            if not arsenal.empty:
-                disp = arsenal[["pitch_label","usage_pct","count","avg_velo"]].copy()
-                disp["usage_pct"] = (disp["usage_pct"]*100).round(1).astype(str)+"%"
-                disp.columns = ["Pitch","Usage %","Count","Avg Velo (mph)"]
-                st.dataframe(disp, use_container_width=True, hide_index=True)
-            else:
-                st.info("No arsenal data found.")
+            labels  = [f"{r['full_name']} — {r['team']}" for r in pitchers]
+            chosen  = st.selectbox("Select pitcher", labels, key="hist_pitcher_sel")
+            pid     = pitchers[labels.index(chosen)]["player_id"]
+
+            ptab1, ptab2 = st.tabs(["Game Log", "Season Arsenal"])
+
+            with ptab1:
+                st.markdown("#### Start-by-Start Log")
+                plog = get_pitcher_game_log(pid)
+                if not plog.empty:
+                    disp = plog[["game_date","pitches","strikeouts","whiffs","whiff_rate"]].copy()
+                    disp.columns = ["Date","Pitches","K","Whiffs","Whiff%"]
+                    st.dataframe(disp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No Statcast data found for this pitcher this season.")
+
+            with ptab2:
+                arsenal = get_pitcher_arsenal(pid)
+                if not arsenal.empty:
+                    disp = arsenal[["pitch_label","usage_pct","count","avg_velo"]].copy()
+                    disp["usage_pct"] = (disp["usage_pct"]*100).round(1).astype(str)+"%"
+                    disp.columns = ["Pitch","Usage %","Count","Avg Velo (mph)"]
+                    st.dataframe(disp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No arsenal data found for this season.")
         else:
             st.warning("No pitchers found.")

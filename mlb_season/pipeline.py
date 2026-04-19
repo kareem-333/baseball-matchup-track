@@ -368,7 +368,7 @@ def get_last_n_completed_games(team_id: int, n: int = 3) -> list[dict]:
     today = date.today()
     start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     try:
-        games = statsapi.schedule(teamId=team_id, start_date=start, end_date=_today_str(), sportId=1)
+        games = statsapi.schedule(team=team_id, start_date=start, end_date=_today_str(), sportId=1)
         completed = [g for g in games if g.get("status") in ("Final","Game Over")]
         return list(reversed(completed))[:n]
     except Exception:
