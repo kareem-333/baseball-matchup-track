@@ -583,6 +583,179 @@ def _fallback_baselines() -> dict:
             for pt, v in defaults.items()}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def predict_lineup_vs_hand(
+    team_id: int,
+    opposing_sp_hand: str,
+    n_games: int = 5,
+) -> pd.DataFrame:
+    """
+    Predicts a team's likely lineup by looking at their last N games played
+    AGAINST a starting pitcher of the specified handedness.
+
+    Returns DataFrame with columns:
+        order, player_id, name, appearances, confidence_pct, handedness
+    """
+    from core.handedness import get_batter_handedness, get_pitcher_handedness
+
+    buffer_games = n_games * 3
+    today = date.today()
+    start = (today - timedelta(days=60)).strftime("%Y-%m-%d")
+    try:
+        games_raw = statsapi.schedule(
+            team=team_id, start_date=start, end_date=_today_str(), sportId=1
+        )
+        completed = [g for g in games_raw if g.get("status") in ("Final", "Game Over")]
+        completed = list(reversed(completed))[:buffer_games]
+    except Exception:
+        return pd.DataFrame()
+
+    matching_games = []
+    for g in completed:
+        if len(matching_games) >= n_games:
+            break
+        gid = g.get("game_id")
+        if not gid:
+            continue
+        try:
+            data = statsapi.get("game", {"gamePk": gid})
+            gd = data.get("gameData", {})
+            box = data.get("liveData", {}).get("boxscore", {})
+
+            home_id = gd.get("teams", {}).get("home", {}).get("id")
+            opp_side = "away" if home_id == team_id else "home"
+
+            pitchers = box.get("teams", {}).get(opp_side, {}).get("pitchers", [])
+            if not pitchers:
+                continue
+            opp_sp_id = pitchers[0]
+            opp_sp_hand = get_pitcher_handedness(opp_sp_id)
+
+            if opp_sp_hand != opposing_sp_hand:
+                continue
+
+            my_side = "home" if home_id == team_id else "away"
+            matching_games.append({"game_id": gid, "data": data, "my_side": my_side})
+        except Exception:
+            continue
+
+    if not matching_games:
+        return pd.DataFrame()
+
+    pos_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    appearance_counts: dict[int, int] = defaultdict(int)
+    name_map: dict[int, str] = {}
+
+    for mg in matching_games:
+        data = mg["data"]
+        my_side = mg["my_side"]
+        box = data.get("liveData", {}).get("boxscore", {})
+        order = box.get("teams", {}).get(my_side, {}).get("battingOrder", [])
+        players = box.get("teams", {}).get(my_side, {}).get("players", {})
+
+        for slot, pid in enumerate(order[:9], 1):
+            pos_counts[pid][slot] += 1
+            appearance_counts[pid] += 1
+            name_map[pid] = (
+                players.get(f"ID{pid}", {}).get("person", {}).get("fullName", str(pid))
+            )
+
+    if not pos_counts:
+        return pd.DataFrame()
+
+    n_matching = len(matching_games)
+    rows = []
+    for pid, slots in pos_counts.items():
+        best_slot = max(slots, key=slots.get)
+        appearances = appearance_counts[pid]
+        confidence_pct = round((appearances / n_matching) * 100)
+        rows.append({
+            "order": best_slot,
+            "player_id": pid,
+            "name": name_map.get(pid, str(pid)),
+            "appearances": appearances,
+            "games_sampled": n_matching,
+            "confidence_pct": confidence_pct,
+            "handedness": get_batter_handedness(pid),
+        })
+
+    df = (
+        pd.DataFrame(rows)
+        .sort_values(["order", "confidence_pct"], ascending=[True, False])
+        .drop_duplicates("order")
+        .head(9)
+        .reset_index(drop=True)
+    )
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_confirmed_lineup(game_id: int, team_id: int) -> tuple[pd.DataFrame, str]:
+    """
+    Checks if a confirmed lineup exists for a team in a given game.
+
+    Returns (df, status) where status is one of:
+        'confirmed'  — full 9-player lineup posted
+        'partial'    — some players listed but not 9
+        'none'       — no lineup posted yet
+
+    DataFrame columns when available: order, player_id, name, handedness
+    """
+    from core.handedness import get_batter_handedness
+
+    try:
+        data = statsapi.get("game", {"gamePk": game_id})
+        box = data.get("liveData", {}).get("boxscore", {})
+        gd = data.get("gameData", {})
+        home_id = gd.get("teams", {}).get("home", {}).get("id")
+        side = "home" if home_id == team_id else "away"
+
+        order = box.get("teams", {}).get(side, {}).get("battingOrder", [])
+        players = box.get("teams", {}).get(side, {}).get("players", {})
+
+        if not order:
+            return pd.DataFrame(), "none"
+
+        rows = []
+        for slot, pid in enumerate(order[:9], 1):
+            p = players.get(f"ID{pid}", {})
+            rows.append({
+                "order": slot,
+                "player_id": pid,
+                "name": p.get("person", {}).get("fullName", str(pid)),
+                "handedness": get_batter_handedness(pid),
+            })
+
+        df = pd.DataFrame(rows)
+        status = "confirmed" if len(df) >= 9 else "partial"
+        return df, status
+    except Exception:
+        return pd.DataFrame(), "none"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_pitcher_sample_flag(pitcher_id: int, season: int | None = None) -> dict:
+    """
+    Returns {'total_pitches': int, 'is_low_sample': bool, 'reason': str}.
+    Threshold: under 200 total pitches = low sample.
+    """
+    season = season or date.today().year
+    df = fetch_statcast_csv(pitcher_id, "pitcher", season)
+    total = len(df) if not df.empty else 0
+    is_low = total < 200
+    reason = ""
+    if is_low:
+        if total == 0:
+            reason = "No pitches thrown this season yet"
+        else:
+            reason = f"Only {total} pitches thrown — results may be unstable"
+    return {
+        "total_pitches": total,
+        "is_low_sample": is_low,
+        "reason": reason,
+    }
+
+
 def get_player_headshot_url(player_id: int) -> str:
     return (
         f"https://img.mlbstatic.com/mlb-photos/image/upload/"
