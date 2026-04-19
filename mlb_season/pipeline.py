@@ -368,7 +368,7 @@ def get_last_n_completed_games(team_id: int, n: int = 3) -> list[dict]:
     today = date.today()
     start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     try:
-        games = statsapi.schedule(teamId=team_id, start_date=start, end_date=_today_str(), sportId=1)
+        games = statsapi.schedule(team=team_id, start_date=start, end_date=_today_str(), sportId=1)
         completed = [g for g in games if g.get("status") in ("Final","Game Over")]
         return list(reversed(completed))[:n]
     except Exception:
@@ -581,95 +581,6 @@ def _fallback_baselines() -> dict:
                   "whiff_rate_mean": v[2],  "whiff_rate_std": v[3],
                   "usage_pct_mean":  v[4],  "usage_pct_std":  v[5]}
             for pt, v in defaults.items()}
-
-
-# ── live / schedule ───────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=120, show_spinner=False)
-def get_todays_games() -> list[dict]:
-    try:
-        raw = statsapi.schedule(date=_today_str())
-        return [{
-            "game_pk":                  g["game_id"],
-            "status":                   g["status"],
-            "away_team":                g["away_name"],
-            "home_team":                g["home_name"],
-            "away_id":                  g["away_id"],
-            "home_id":                  g["home_id"],
-            "away_score":               g.get("away_score", 0),
-            "home_score":               g.get("home_score", 0),
-            "game_datetime":            g.get("game_datetime", ""),
-            "venue":                    g.get("venue_name", ""),
-            "inning":                   g.get("current_inning", 0),
-            "inning_state":             g.get("inning_state", ""),
-            "away_probable_pitcher":    g.get("away_probable_pitcher", "TBD"),
-            "away_probable_pitcher_id": g.get("away_probable_pitcher_id"),
-            "home_probable_pitcher":    g.get("home_probable_pitcher", "TBD"),
-            "home_probable_pitcher_id": g.get("home_probable_pitcher_id"),
-        } for g in raw]
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def get_live_game_data(game_pk: int) -> dict:
-    try:
-        feed = statsapi.get("game", {"gamePk": game_pk})
-        gd   = feed.get("gameData", {})
-        ld   = feed.get("liveData", {})
-        ls   = ld.get("linescore", {})
-        matchup = ld.get("plays", {}).get("currentPlay", {}).get("matchup", {})
-        batter  = matchup.get("batter", {})
-        pitcher = matchup.get("pitcher", {})
-        return {
-            "game_pk":              game_pk,
-            "status":               gd.get("status", {}).get("detailedState", "Unknown"),
-            "inning":               ls.get("currentInning", 0),
-            "inning_state":         ls.get("inningState", ""),
-            "outs":                 ls.get("outs", 0),
-            "balls":                ls.get("balls", 0),
-            "strikes":              ls.get("strikes", 0),
-            "home_team":            gd.get("teams", {}).get("home", {}).get("name", ""),
-            "away_team":            gd.get("teams", {}).get("away", {}).get("name", ""),
-            "home_id":              gd.get("teams", {}).get("home", {}).get("id"),
-            "away_id":              gd.get("teams", {}).get("away", {}).get("id"),
-            "home_score":           ls.get("teams", {}).get("home", {}).get("runs", 0),
-            "away_score":           ls.get("teams", {}).get("away", {}).get("runs", 0),
-            "current_batter_id":    batter.get("id"),
-            "current_batter_name":  batter.get("fullName", ""),
-            "current_pitcher_id":   pitcher.get("id"),
-            "current_pitcher_name": pitcher.get("fullName", ""),
-            "linescore":            ls,
-            "boxscore":             ld.get("boxscore", {}),
-        }
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_game_lineup(game_pk: int, team_id: int) -> list[dict]:
-    try:
-        feed = statsapi.get("game", {"gamePk": game_pk})
-        gd   = feed.get("gameData", {})
-        box  = feed.get("liveData", {}).get("boxscore", {})
-        side = "home" if gd.get("teams",{}).get("home",{}).get("id") == team_id else "away"
-        players = box.get("teams",{}).get(side,{}).get("players",{})
-        order   = box.get("teams",{}).get(side,{}).get("battingOrder",[])
-        return [{"player_id": pid,
-                 "name": players.get(f"ID{pid}",{}).get("person",{}).get("fullName", str(pid)),
-                 "position": players.get(f"ID{pid}",{}).get("position",{}).get("abbreviation","")}
-                for pid in order]
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_probable_lineups(game_pk: int) -> dict:
-    try:
-        feed = statsapi.get("game", {"gamePk": game_pk})
-        return feed.get("gameData", {}).get("probablePitchers", {})
-    except Exception:
-        return {}
 
 
 def get_player_headshot_url(player_id: int) -> str:

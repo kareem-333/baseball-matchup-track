@@ -22,6 +22,38 @@ def today_str() -> str:
     return date.today().strftime("%Y-%m-%d")
 
 
+# ── All games (multi-team schedule) ──────────────────────────────────────────
+
+def get_all_todays_games() -> list[dict]:
+    """Return all MLB games scheduled today (every team, not just one)."""
+    return statsapi.schedule(sportId=1, start_date=today_str(), end_date=today_str())
+
+
+def get_game_lineup(game_id: int, team_id: int) -> list[dict]:
+    """
+    Return the batting order for a team in a given game.
+    Each entry: {player_id, name, position}
+    """
+    try:
+        box = get_live_box_score(game_id)
+        side = _side_for_team(box, team_id)
+        if side is None:
+            return []
+        team_data = box.get(side, {})
+        players   = team_data.get("players", {})
+        order     = team_data.get("batters", [])
+        return [
+            {
+                "player_id": pid,
+                "name":      players.get(f"ID{pid}", {}).get("person", {}).get("fullName", str(pid)),
+                "position":  players.get(f"ID{pid}", {}).get("position", {}).get("abbreviation", ""),
+            }
+            for pid in order
+        ]
+    except Exception:
+        return []
+
+
 # ── Teams ─────────────────────────────────────────────────────────────────────
 
 def get_all_teams() -> list[dict]:
