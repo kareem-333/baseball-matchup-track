@@ -1,735 +1,426 @@
-"""
-mlb_season/pipeline.py — Season-level MLB data pipeline.
+from __future__ import annotations
 
-Statcast CSV downloads (Baseball Savant), MLB Stats API season queries,
-team roster/stats lookups, lineup prediction, and league averages.
-"""
+import math
+from datetime import date, timedelta
 
-import statsapi
-import requests
 import numpy as np
 import pandas as pd
+import statsapi
 import streamlit as st
-from io import StringIO
-from datetime import date, timedelta
-from collections import defaultdict, Counter
+from pybaseball import statcast_batter, statcast_pitcher, statcast
 
-from core.config import ASTROS_ID, PITCH_NAMES
+# ── constants ────────────────────────────────────────────────────────────────
 
-_CURRENT_SEASON = date.today().year
-# Default career window — last 3 full seasons + current
-_CAREER_SEASONS = list(range(_CURRENT_SEASON - 3, _CURRENT_SEASON + 1))
+SEASON_START = {
+    2024: date(2024, 3, 20),
+    2025: date(2025, 3, 27),
+    2026: date(2026, 4, 3),
+}
 
-_SAVANT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+SWING_DESCS = {
+    "swinging_strike", "swinging_strike_blocked",
+    "foul", "foul_tip", "hit_into_play",
+    "foul_bunt", "missed_bunt",
+}
+WHIFF_DESCS = {"swinging_strike", "swinging_strike_blocked"}
+
+PITCH_LABELS = {
+    "FF": "4-Seam FB", "SI": "Sinker", "FC": "Cutter",
+    "SL": "Slider", "ST": "Sweeper", "CU": "Curveball",
+    "KC": "Knuckle Curve", "CH": "Changeup", "FS": "Splitter",
+    "SV": "Slurve", "FO": "Forkball", "KN": "Knuckleball",
+    "EP": "Eephus", "SC": "Screwball",
 }
 
 
-# ── Statcast data fetching ────────────────────────────────────────────────────
+def _season_start(season: int) -> date:
+    return SEASON_START.get(season, date(season, 4, 1))
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_statcast_csv(player_id: int, player_type: str, season: int) -> pd.DataFrame:
-    """
-    Download one season of Statcast pitch-level data for a player.
-    player_type: 'batter' or 'pitcher'
-    """
-    lookup_param = (
-        f"batters_lookup%5B%5D={player_id}" if player_type == "batter"
-        else f"pitchers_lookup%5B%5D={player_id}"
-    )
-    url = (
-        "https://baseballsavant.mlb.com/statcast_search/csv?"
-        f"all=true&hfGT=R%7C&hfSea={season}%7C&player_type={player_type}"
-        f"&{lookup_param}&min_pitches=0&min_results=0"
-        "&group_by=name&sort_col=pitches&sort_order=desc&type=details"
-    )
+
+def _today_str() -> str:
+    return date.today().strftime("%Y-%m-%d")
+
+
+def _season_start_str(season: int) -> str:
+    return _season_start(season).strftime("%Y-%m-%d")
+
+
+# ── live / schedule ──────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=120)
+def get_todays_games() -> list[dict]:
+    """All games scheduled today from the MLB StatsAPI."""
+    raw = statsapi.schedule(date=_today_str())
+    games = []
+    for g in raw:
+        games.append({
+            "game_pk": g["game_id"],
+            "status": g["status"],
+            "away_team": g["away_name"],
+            "home_team": g["home_name"],
+            "away_id": g["away_id"],
+            "home_id": g["home_id"],
+            "away_score": g.get("away_score", 0),
+            "home_score": g.get("home_score", 0),
+            "game_datetime": g.get("game_datetime", ""),
+            "venue": g.get("venue_name", ""),
+            "inning": g.get("current_inning", 0),
+            "inning_state": g.get("inning_state", ""),
+            "away_probable_pitcher_id": g.get("away_probable_pitcher_id"),
+            "home_probable_pitcher_id": g.get("home_probable_pitcher_id"),
+            "away_probable_pitcher": g.get("away_probable_pitcher", "TBD"),
+            "home_probable_pitcher": g.get("home_probable_pitcher", "TBD"),
+        })
+    return games
+
+
+@st.cache_data(ttl=30)
+def get_live_game_data(game_pk: int) -> dict:
+    """Full live game feed for a given game_pk."""
     try:
-        r = requests.get(url, headers=_SAVANT_HEADERS, timeout=30)
-        if r.status_code != 200 or len(r.content) < 200:
-            return pd.DataFrame()
-        df = pd.read_csv(StringIO(r.text), low_memory=False)
-        # Fix BOM and quoted column name on first column
-        df.columns = (df.columns.str.lstrip("\ufeff")
-                                 .str.strip('"')
-                                 .str.strip("'"))
-        # Normalize numeric columns
-        for col in ["plate_x", "plate_z", "pfx_x", "pfx_z",
-                    "release_speed", "release_spin_rate",
-                    "estimated_ba_using_speedangle", "launch_speed",
-                    "launch_angle", "api_break_x_arm",
-                    "api_break_z_with_gravity", "delta_home_win_exp",
-                    "home_win_exp", "bat_speed", "swing_length"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        if "zone" in df.columns:
-            df["zone"] = pd.to_numeric(df["zone"], errors="coerce")
-        if "launch_speed_angle" in df.columns:
-            df["launch_speed_angle"] = pd.to_numeric(df["launch_speed_angle"], errors="coerce")
-        return df
+        feed = statsapi.get("game", {"gamePk": game_pk})
+        gd = feed.get("gameData", {})
+        ld = feed.get("liveData", {})
+        linescore = ld.get("linescore", {})
+        boxscore = ld.get("boxscore", {})
+        plays = ld.get("plays", {})
+
+        current_play = plays.get("currentPlay", {})
+        matchup = current_play.get("matchup", {})
+        batter = matchup.get("batter", {})
+        pitcher = matchup.get("pitcher", {})
+
+        return {
+            "game_pk": game_pk,
+            "status": gd.get("status", {}).get("detailedState", "Unknown"),
+            "inning": linescore.get("currentInning", 0),
+            "inning_state": linescore.get("inningState", ""),
+            "half": linescore.get("inningHalf", ""),
+            "outs": linescore.get("outs", 0),
+            "balls": linescore.get("balls", 0),
+            "strikes": linescore.get("strikes", 0),
+            "home_team": gd.get("teams", {}).get("home", {}).get("name", ""),
+            "away_team": gd.get("teams", {}).get("away", {}).get("name", ""),
+            "home_id": gd.get("teams", {}).get("home", {}).get("id"),
+            "away_id": gd.get("teams", {}).get("away", {}).get("id"),
+            "home_score": linescore.get("teams", {}).get("home", {}).get("runs", 0),
+            "away_score": linescore.get("teams", {}).get("away", {}).get("runs", 0),
+            "current_batter_id": batter.get("id"),
+            "current_batter_name": batter.get("fullName", ""),
+            "current_pitcher_id": pitcher.get("id"),
+            "current_pitcher_name": pitcher.get("fullName", ""),
+            "linescore": linescore,
+            "boxscore": boxscore,
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=60)
+def get_game_lineup(game_pk: int, team_id: int) -> list[dict]:
+    """Batting order for a team in a given game."""
+    try:
+        feed = statsapi.get("game", {"gamePk": game_pk})
+        ld = feed.get("liveData", {})
+        boxscore = ld.get("boxscore", {})
+
+        side = None
+        gd = feed.get("gameData", {})
+        if gd.get("teams", {}).get("home", {}).get("id") == team_id:
+            side = "home"
+        elif gd.get("teams", {}).get("away", {}).get("id") == team_id:
+            side = "away"
+        if side is None:
+            return []
+
+        players_dict = boxscore.get("teams", {}).get(side, {}).get("players", {})
+        batting_order = boxscore.get("teams", {}).get(side, {}).get("battingOrder", [])
+
+        lineup = []
+        for pid in batting_order:
+            key = f"ID{pid}"
+            p = players_dict.get(key, {})
+            info = p.get("person", {})
+            pos = p.get("position", {}).get("abbreviation", "")
+            lineup.append({
+                "player_id": pid,
+                "name": info.get("fullName", str(pid)),
+                "position": pos,
+            })
+        return lineup
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def get_probable_lineups(game_pk: int) -> dict:
+    """Try to fetch probable lineups for a pre-game matchup."""
+    try:
+        feed = statsapi.get("game", {"gamePk": game_pk})
+        gd = feed.get("gameData", {})
+        pitchers = {
+            "home": gd.get("probablePitchers", {}).get("home", {}),
+            "away": gd.get("probablePitchers", {}).get("away", {}),
+        }
+        return pitchers
+    except Exception:
+        return {}
+
+
+# ── pitcher arsenal ──────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def get_pitcher_arsenal(pitcher_id: int, season: int | None = None) -> pd.DataFrame:
+    """
+    Pitcher's pitch mix for the given season from Statcast.
+
+    Returns columns: pitch_type, pitch_label, usage_pct, count,
+                     avg_velocity, last_appearance_date, appearances_used
+    """
+    season = season or date.today().year
+    start = _season_start_str(season)
+    end = _today_str()
+
+    try:
+        df = statcast_pitcher(start, end, pitcher_id)
     except Exception:
         return pd.DataFrame()
 
-
-def _best_season_df(player_id: int, player_type: str) -> pd.DataFrame:
-    """Try current season first, fall back to previous if < 30 rows."""
-    cur = date.today().year
-    df = fetch_statcast_csv(player_id, player_type, cur)
-    if len(df) >= 30:
-        return df
-    prev = fetch_statcast_csv(player_id, player_type, cur - 1)
-    if len(prev) > len(df):
-        return prev
-    return df
-
-
-# ── Pitcher arsenal ───────────────────────────────────────────────────────────
-
-def get_pitcher_arsenal(pitcher_id: int) -> pd.DataFrame:
-    """
-    Returns pitch arsenal: pitch_type, pitch_name, usage_pct, avg_velo,
-    avg_spin, avg_h_break, avg_v_break, avg_x, avg_z.
-    """
-    from core.config import PITCH_NAMES
-    df = _best_season_df(pitcher_id, "pitcher")
-    if df.empty or "pitch_type" not in df.columns:
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    df = df[df["pitch_type"].notna() & (df["pitch_type"] != "")]
-    rows = []
+    df = df.dropna(subset=["pitch_type"])
+    df = df[df["pitch_type"] != ""]
+
     total = len(df)
-    for pt, g in df.groupby("pitch_type"):
-        rows.append({
-            "pitch_type":  pt,
-            "pitch_name":  PITCH_NAMES.get(pt, g["pitch_name"].iloc[0] if "pitch_name" in g.columns else pt),
-            "count":       len(g),
-            "usage_pct":   len(g) / total * 100,
-            "avg_velo":    g["release_speed"].mean() if "release_speed" in g.columns else 0,
-            "avg_spin":    g["release_spin_rate"].mean() if "release_spin_rate" in g.columns else 0,
-            "avg_h_break": g["api_break_x_arm"].mean() if "api_break_x_arm" in g.columns else 0,
-            "avg_v_break": g["api_break_z_with_gravity"].mean() if "api_break_z_with_gravity" in g.columns else 0,
-            "avg_x":       g["plate_x"].mean() if "plate_x" in g.columns else 0,
-            "avg_z":       g["plate_z"].mean() if "plate_z" in g.columns else 0,
-        })
-    return pd.DataFrame(rows).sort_values("usage_pct", ascending=False)
-
-
-# ── Batter pitch splits ───────────────────────────────────────────────────────
-
-def get_batter_pitch_splits(batter_id: int) -> pd.DataFrame:
-    """
-    Returns per-pitch-type split: pitch_type, pitch_name, pa, barrel_rate, xba.
-    """
-    from core.config import PITCH_NAMES
-    df = _best_season_df(batter_id, "batter")
-    if df.empty or "pitch_type" not in df.columns:
+    if total == 0:
         return pd.DataFrame()
 
-    df = df[df["pitch_type"].notna() & (df["pitch_type"] != "")]
+    # Per-appearance dates for decay support
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"]).dt.date
+        appearances = sorted(df["game_date"].unique(), reverse=True)
+        last_date = appearances[0] if appearances else None
+        n_appearances = len(appearances)
+    else:
+        last_date = None
+        n_appearances = 0
+
+    pitch_groups = df.groupby("pitch_type")
     rows = []
-    for pt, g in df.groupby("pitch_type"):
-        bip = g[g["type"] == "X"] if "type" in g.columns else g
-        n_bip = len(bip)
-        # Barrel: launch_speed_angle == 6
-        barrels = (bip["launch_speed_angle"] == 6).sum() if "launch_speed_angle" in bip.columns else 0
-        xba_vals = bip["estimated_ba_using_speedangle"].dropna() if "estimated_ba_using_speedangle" in bip.columns else pd.Series(dtype=float)
+    for pt, grp in pitch_groups:
+        velocity = (
+            grp["release_speed"].dropna().mean()
+            if "release_speed" in grp.columns
+            else None
+        )
         rows.append({
-            "pitch_type":  pt,
-            "pitch_name":  PITCH_NAMES.get(pt, pt),
-            "pitches":     len(g),
-            "bip":         n_bip,
-            "barrel_rate": barrels / n_bip * 100 if n_bip >= 5 else np.nan,
-            "xba":         float(xba_vals.mean()) if len(xba_vals) >= 3 else np.nan,
-        })
-    df_out = pd.DataFrame(rows)
-    return df_out[df_out["pitches"] >= 10].sort_values("pitches", ascending=False)
-
-
-# ── Multi-season Statcast fetch ───────────────────────────────────────────────
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_statcast_multi_season(
-    player_id: int,
-    player_type: str,
-    seasons: tuple[int, ...] | None = None,
-) -> pd.DataFrame:
-    """
-    Fetch and concatenate Statcast pitch-level data across multiple seasons.
-
-    seasons: tuple of ints, e.g. (2022, 2023, 2024, 2025).
-             Defaults to the last 3 full seasons + current year.
-    player_type: 'batter' or 'pitcher'.
-
-    Returns a single DataFrame with a 'season' column added.
-    Seasons with no data are silently skipped.
-    """
-    if seasons is None:
-        cur = date.today().year
-        seasons = tuple(range(cur - 3, cur + 1))
-
-    frames = []
-    for yr in seasons:
-        df = fetch_statcast_csv(player_id, player_type, yr)
-        if not df.empty:
-            df = df.copy()
-            df["season"] = yr
-            frames.append(df)
-    if not frames:
-        return pd.DataFrame()
-    combined = pd.concat(frames, ignore_index=True)
-    # Ensure season is int
-    combined["season"] = combined["season"].astype(int)
-    return combined
-
-
-# ── Career batter pitch-type splits ──────────────────────────────────────────
-
-def _whiff_rate(g: pd.DataFrame) -> float:
-    """Swinging strikes / total swings (swing = S or contact on swing)."""
-    if "description" not in g.columns:
-        return np.nan
-    swings = g["description"].isin([
-        "swinging_strike", "swinging_strike_blocked", "foul",
-        "foul_tip", "foul_bunt", "missed_bunt",
-        "hit_into_play", "hit_into_play_score", "hit_into_play_no_out",
-    ])
-    whiffs = g["description"].isin(["swinging_strike", "swinging_strike_blocked"])
-    n_swings = swings.sum()
-    return float(whiffs.sum() / n_swings * 100) if n_swings >= 5 else np.nan
-
-
-def _hard_hit_rate(bip: pd.DataFrame) -> float:
-    """BIP with exit velo >= 95 mph / total BIP."""
-    if "launch_speed" not in bip.columns or len(bip) < 5:
-        return np.nan
-    ev = pd.to_numeric(bip["launch_speed"], errors="coerce").dropna()
-    if len(ev) < 5:
-        return np.nan
-    return float((ev >= 95).sum() / len(ev) * 100)
-
-
-def _avg_ev(bip: pd.DataFrame) -> float:
-    if "launch_speed" not in bip.columns:
-        return np.nan
-    ev = pd.to_numeric(bip["launch_speed"], errors="coerce").dropna()
-    return float(ev.mean()) if len(ev) >= 3 else np.nan
-
-
-def _xwoba(g: pd.DataFrame) -> float:
-    col = "estimated_woba_using_speedangle"
-    if col not in g.columns:
-        return np.nan
-    vals = pd.to_numeric(g[col], errors="coerce").dropna()
-    return float(vals.mean()) if len(vals) >= 5 else np.nan
-
-
-def _k_rate_from_events(g: pd.DataFrame) -> float:
-    """Strikeout rate per plate appearance (events = 'strikeout' on last pitch of PA)."""
-    if "events" not in g.columns:
-        return np.nan
-    pa_rows = g[g["events"].notna() & (g["events"] != "")]
-    if len(pa_rows) < 5:
-        return np.nan
-    ks = (pa_rows["events"] == "strikeout").sum()
-    return float(ks / len(pa_rows) * 100)
-
-
-def _splits_for_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute per-pitch-type stats from a Statcast DataFrame.
-    Returns rows with columns: pitch_type, pitch_name, pitches, bip,
-    whiff_rate, k_rate, barrel_rate, hard_hit_rate, avg_ev, xba, xwoba.
-    """
-    df = df[df["pitch_type"].notna() & (df["pitch_type"] != "")].copy()
-    rows = []
-    total = len(df)
-    for pt, g in df.groupby("pitch_type"):
-        bip = g[g["type"] == "X"].copy() if "type" in g.columns else g.copy()
-        n_bip = len(bip)
-        barrels = 0
-        if "launch_speed_angle" in bip.columns and n_bip >= 3:
-            barrels = (pd.to_numeric(bip["launch_speed_angle"], errors="coerce") == 6).sum()
-        xba_col = "estimated_ba_using_speedangle"
-        xba_vals = pd.to_numeric(bip[xba_col], errors="coerce").dropna() if xba_col in bip.columns else pd.Series(dtype=float)
-
-        rows.append({
-            "pitch_type":    pt,
-            "pitch_name":    PITCH_NAMES.get(pt, g["pitch_name"].iloc[0] if "pitch_name" in g.columns else pt),
-            "pitches":       len(g),
-            "usage_pct":     round(len(g) / total * 100, 1) if total > 0 else 0.0,
-            "bip":           n_bip,
-            "whiff_rate":    _whiff_rate(g),
-            "k_rate":        _k_rate_from_events(g),
-            "barrel_rate":   float(barrels / n_bip * 100) if n_bip >= 5 else np.nan,
-            "hard_hit_rate": _hard_hit_rate(bip),
-            "avg_ev":        _avg_ev(bip),
-            "xba":           float(xba_vals.mean()) if len(xba_vals) >= 3 else np.nan,
-            "xwoba":         _xwoba(g),
+            "pitch_type": pt,
+            "pitch_label": PITCH_LABELS.get(pt, pt),
+            "count": len(grp),
+            "usage_pct": round(len(grp) / total, 4),
+            "avg_velocity": round(velocity, 1) if velocity is not None else None,
+            "last_appearance_date": last_date,
+            "appearances_used": n_appearances,
         })
 
-    out = pd.DataFrame(rows)
-    return out[out["pitches"] >= 10].sort_values("pitches", ascending=False) if not out.empty else out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_batter_career_pitch_splits(
-    batter_id: int,
-    seasons: tuple[int, ...] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Return career-level and season-by-season pitch-type split stats for a batter.
-
-    Returns:
-        career_df    — one row per pitch type, aggregated across all seasons
-        by_season_df — one row per (season, pitch_type), for trend charts
-
-    Both DataFrames carry the same stats columns:
-        pitch_type, pitch_name, pitches, usage_pct, bip,
-        whiff_rate, k_rate, barrel_rate, hard_hit_rate, avg_ev, xba, xwoba
-    """
-    if seasons is None:
-        cur = date.today().year
-        seasons = tuple(range(cur - 3, cur + 1))
-
-    combined = fetch_statcast_multi_season(batter_id, "batter", seasons)
-    if combined.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # ── Career aggregate ──────────────────────────────────────────────────────
-    career_df = _splits_for_df(combined)
-    if not career_df.empty:
-        career_df.insert(0, "season", "Career")
-
-    # ── Season-by-season breakdown ────────────────────────────────────────────
-    season_rows = []
-    for yr in sorted(combined["season"].unique()):
-        yr_df = combined[combined["season"] == yr]
-        splits = _splits_for_df(yr_df)
-        if not splits.empty:
-            splits.insert(0, "season", int(yr))
-            season_rows.append(splits)
-
-    by_season_df = pd.concat(season_rows, ignore_index=True) if season_rows else pd.DataFrame()
-
-    return career_df, by_season_df
-
-
-# ── Batter hot zones ──────────────────────────────────────────────────────────
-
-def get_batter_hot_zones(batter_id: int) -> dict[int, float]:
-    """
-    Returns {zone_num: xba} for zones 1-9.
-    """
-    df = _best_season_df(batter_id, "batter")
-    if df.empty or "zone" not in df.columns:
-        return {}
-
-    bip = df[(df["type"] == "X") & df["zone"].between(1, 9)] if "type" in df.columns else df[df["zone"].between(1, 9)]
-    if bip.empty or "estimated_ba_using_speedangle" not in bip.columns:
-        return {}
-
-    result = {}
-    for z in range(1, 10):
-        z_bip = bip[bip["zone"] == z]["estimated_ba_using_speedangle"].dropna()
-        result[z] = float(z_bip.mean()) if len(z_bip) >= 3 else 0.0
+    result = pd.DataFrame(rows).sort_values("usage_pct", ascending=False).reset_index(drop=True)
     return result
 
 
-# ── Barrel rate by game (trend) ───────────────────────────────────────────────
+# ── batter pitch splits ──────────────────────────────────────────────────────
 
-def get_barrel_trend(batter_id: int, n_games: int = 15) -> pd.DataFrame:
-    """Rolling barrel rate per game over last n games."""
-    df = _best_season_df(batter_id, "batter")
-    if df.empty or "game_date" not in df.columns or "launch_speed_angle" not in df.columns:
-        return pd.DataFrame()
+@st.cache_data(ttl=3600)
+def get_batter_pitch_splits(batter_id: int, season: int | None = None) -> pd.DataFrame:
+    """
+    Batter's performance vs each pitch type, split by pitcher handedness.
 
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    bip = df[df["type"] == "X"].copy() if "type" in df.columns else df.copy()
-    bip = bip[bip["game_date"].notna()]
+    Returns columns: pitch_type, pitch_label, vs_hand, barrel_rate,
+                     whiff_rate, sample_size, last_event_date
+    """
+    season = season or date.today().year
+    start = _season_start_str(season)
+    end = _today_str()
 
-    rows = []
-    for gdate, g in bip.groupby("game_date"):
-        n_bip = len(g)
-        barrels = (g["launch_speed_angle"] == 6).sum()
-        rows.append({
-            "date":        gdate,
-            "bip":         n_bip,
-            "barrels":     int(barrels),
-            "barrel_rate": barrels / n_bip * 100 if n_bip > 0 else 0,
-        })
-
-    result = pd.DataFrame(rows).sort_values("date")
-    return result.tail(n_games)
-
-
-# ── Aggregation helpers ───────────────────────────────────────────────────────
-
-def _side_for_team(box: dict, team_id: int) -> str | None:
-    """Return 'home' or 'away' for the given team_id in this box score."""
-    for side in ("home", "away"):
-        if box.get(side, {}).get("team", {}).get("id") == team_id:
-            return side
-    return None
-
-
-def _ip_to_float(ip_str) -> float:
     try:
-        whole, frac = str(ip_str).split(".") if "." in str(ip_str) else (str(ip_str), "0")
-        return int(whole) + int(frac) / 3
+        df = statcast_batter(start, end, batter_id)
     except Exception:
-        return 0.0
-
-
-def _float_to_ip(ip_float: float) -> str:
-    whole = int(ip_float)
-    frac = round((ip_float - whole) * 3)
-    if frac >= 3:
-        whole += 1
-        frac = 0
-    return f"{whole}.{frac}"
-
-
-def get_last_n_completed_games(team_id: int, n: int = 3) -> list[dict]:
-    """Return last n Final games for a team (looks back up to 5 weeks)."""
-    end = date.today()
-    start = end - timedelta(days=35)
-    games = statsapi.schedule(
-        sportId=1, team=team_id,
-        start_date=start.strftime("%Y-%m-%d"),
-        end_date=end.strftime("%Y-%m-%d"),
-    )
-    completed = [g for g in games if "Final" in g.get("status", "")]
-    return completed[-n:]
-
-
-def aggregate_batting_stats(game_ids: list[int], team_id: int) -> pd.DataFrame:
-    """Sum batting stats across multiple completed games for one team."""
-    from mlb_live.pipeline import get_live_box_score, build_batting_table
-    totals: dict[str, dict] = {}
-    for gid in game_ids:
-        try:
-            box = get_live_box_score(gid)
-            side = _side_for_team(box, team_id)
-            if not side:
-                continue
-            for _, row in build_batting_table(box, side).iterrows():
-                name = row["Player"]
-                if name not in totals:
-                    totals[name] = {"Player": name, "Pos": row["Pos"],
-                                    "G": 0, "AB": 0, "R": 0, "H": 0, "RBI": 0, "BB": 0, "K": 0}
-                totals[name]["G"]   += 1
-                totals[name]["AB"]  += int(row.get("AB") or 0)
-                totals[name]["R"]   += int(row.get("R") or 0)
-                totals[name]["H"]   += int(row.get("H") or 0)
-                totals[name]["RBI"] += int(row.get("RBI") or 0)
-                totals[name]["BB"]  += int(row.get("BB") or 0)
-                totals[name]["K"]   += int(row.get("K") or 0)
-        except Exception:
-            continue
-
-    if not totals:
         return pd.DataFrame()
 
-    df = pd.DataFrame(list(totals.values()))
-    df["AVG"] = df.apply(lambda r: f"{r['H']/r['AB']:.3f}" if r["AB"] > 0 else ".000", axis=1)
-    return df[["Player", "Pos", "G", "AB", "R", "H", "RBI", "BB", "K", "AVG"]].sort_values("AB", ascending=False)
-
-
-def aggregate_pitching_stats(game_ids: list[int], team_id: int) -> pd.DataFrame:
-    """Sum pitching stats across multiple completed games for one team."""
-    from mlb_live.pipeline import get_live_box_score, build_pitching_table
-    totals: dict[str, dict] = {}
-    for gid in game_ids:
-        try:
-            box = get_live_box_score(gid)
-            side = _side_for_team(box, team_id)
-            if not side:
-                continue
-            for _, row in build_pitching_table(box, side).iterrows():
-                name = row["Pitcher"]
-                if name not in totals:
-                    totals[name] = {"Pitcher": name, "G": 0, "_ip": 0.0,
-                                    "H": 0, "R": 0, "ER": 0, "BB": 0, "K": 0}
-                totals[name]["G"]   += 1
-                totals[name]["_ip"] += _ip_to_float(row.get("IP", "0.0"))
-                totals[name]["H"]   += int(row.get("H") or 0)
-                totals[name]["R"]   += int(row.get("R") or 0)
-                totals[name]["ER"]  += int(row.get("ER") or 0)
-                totals[name]["BB"]  += int(row.get("BB") or 0)
-                totals[name]["K"]   += int(row.get("K") or 0)
-        except Exception:
-            continue
-
-    if not totals:
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    df = pd.DataFrame(list(totals.values())).sort_values("_ip", ascending=False)
-    df["IP"]  = df["_ip"].apply(_float_to_ip)
-    df["ERA"] = df.apply(
-        lambda r: f"{r['ER']*9/r['_ip']:.2f}" if r["_ip"] > 0 else "-.--", axis=1
-    )
-    return df[["Pitcher", "G", "IP", "H", "R", "ER", "BB", "K", "ERA"]]
+    df = df.dropna(subset=["pitch_type", "p_throws"])
+    df = df[df["pitch_type"] != ""]
 
-
-# ── Lineup prediction ─────────────────────────────────────────────────────────
-
-def predict_lineup(team_id: int, n_games: int = 5) -> pd.DataFrame:
-    """
-    Predict likely batting order from the last n_games.
-    Returns a DataFrame with Slot, Projected Player, and Confidence columns.
-    """
-    from mlb_live.pipeline import get_live_box_score
-    end = date.today()
-    start = end - timedelta(days=35)
-    games = statsapi.schedule(
-        sportId=1, team=team_id,
-        start_date=start.strftime("%Y-%m-%d"),
-        end_date=end.strftime("%Y-%m-%d"),
-    )
-    completed = [g for g in games if "Final" in g.get("status", "")][-n_games:]
-
-    # slot (1-9) -> Counter of player names
-    slot_counters: dict[int, Counter] = defaultdict(Counter)
-
-    for game in completed:
-        try:
-            box = get_live_box_score(game["game_id"])
-            side = _side_for_team(box, team_id)
-            if not side:
-                continue
-            team_data = box.get(side, {})
-            players = team_data.get("players", {})
-            slot = 1
-            seen: set[str] = set()
-            for pid in team_data.get("batters", []):
-                if slot > 9:
-                    break
-                p = players.get(f"ID{pid}", {})
-                name = p.get("person", {}).get("fullName", "")
-                if name and name not in seen:
-                    slot_counters[slot][name] += 1
-                    seen.add(name)
-                    slot += 1
-        except Exception:
-            continue
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"]).dt.date
 
     rows = []
-    total_games = len(completed)
-    for slot in range(1, 10):
-        counter = slot_counters[slot]
-        if counter:
-            player, count = counter.most_common(1)[0]
-            conf = f"{count}/{total_games}" if total_games else "—"
+    for (pt, hand), grp in df.groupby(["pitch_type", "p_throws"]):
+        n = len(grp)
+
+        # barrel rate: barrels per pitch seen
+        if "launch_speed_angle" in grp.columns:
+            barrels = (grp["launch_speed_angle"] == 6).sum()
         else:
-            player, conf = "Insufficient data", "—"
-        rows.append({"Slot": slot, "Projected Player": player, "Confidence": conf})
+            # manual barrel: EV >= 98 and 26 <= LA <= 30
+            has_ev = grp["launch_speed"].notna() & grp["launch_angle"].notna()
+            barrels = (
+                has_ev
+                & (grp["launch_speed"] >= 98)
+                & (grp["launch_angle"].between(26, 30))
+            ).sum()
+        barrel_rate = barrels / n if n > 0 else 0.0
 
-    return pd.DataFrame(rows)
+        # whiff rate: swinging strikes per swing
+        if "description" in grp.columns:
+            swings = grp["description"].isin(SWING_DESCS).sum()
+            whiffs = grp["description"].isin(WHIFF_DESCS).sum()
+            whiff_rate = whiffs / swings if swings > 0 else 0.0
+        else:
+            whiff_rate = 0.0
 
+        last_date = grp["game_date"].max() if "game_date" in grp.columns else None
 
-# ── Player game logs ──────────────────────────────────────────────────────────
-
-def get_batter_game_log(player_id: int, season: int | None = None) -> list[dict]:
-    """Per-game hitting stats for a batter via MLB Stats API."""
-    if season is None:
-        season = date.today().year
-    try:
-        data = statsapi.get("people", {
-            "personIds": player_id,
-            "hydrate": f"stats(group=hitting,type=gameLog,season={season},gameType=R)",
+        rows.append({
+            "pitch_type": pt,
+            "pitch_label": PITCH_LABELS.get(pt, pt),
+            "vs_hand": hand,
+            "barrel_rate": round(barrel_rate, 4),
+            "whiff_rate": round(whiff_rate, 4),
+            "sample_size": n,
+            "last_event_date": last_date,
         })
-        for person in data.get("people", []):
-            for sg in person.get("stats", []):
-                splits = sg.get("splits", [])
-                if splits:
-                    return [s.get("stat", {}) for s in splits]
-    except Exception:
-        pass
-    return []
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["pitch_type", "vs_hand"]
+    ).reset_index(drop=True)
 
 
-def get_pitcher_game_log(player_id: int, season: int | None = None) -> list[dict]:
-    """Per-game pitching stats for a pitcher via MLB Stats API."""
-    if season is None:
-        season = date.today().year
+# ── league baselines ─────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=86400)
+def get_league_pitch_baselines(season: int) -> dict:
+    """
+    League-wide mean and std for barrel_rate, whiff_rate, usage_pct per pitch type.
+    Pulls last 30 days of Statcast to keep the call manageable.
+    Returns: {pitch_type: {barrel_rate_mean, barrel_rate_std,
+                            whiff_rate_mean, whiff_rate_std,
+                            usage_pct_mean, usage_pct_std}}
+    """
+    end = date.today()
+    start = end - timedelta(days=30)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
     try:
-        data = statsapi.get("people", {
-            "personIds": player_id,
-            "hydrate": f"stats(group=pitching,type=gameLog,season={season},gameType=R)",
-        })
-        for person in data.get("people", []):
-            for sg in person.get("stats", []):
-                splits = sg.get("splits", [])
-                if splits:
-                    return [s.get("stat", {}) for s in splits]
+        df = statcast(start_str, end_str)
     except Exception:
-        pass
-    return []
+        return _fallback_baselines()
+
+    if df is None or df.empty:
+        return _fallback_baselines()
+
+    df = df.dropna(subset=["pitch_type"])
+    df = df[df["pitch_type"] != ""]
+
+    # barrel flag
+    if "launch_speed_angle" in df.columns:
+        df["is_barrel"] = (df["launch_speed_angle"] == 6).astype(int)
+    else:
+        has_ev = df["launch_speed"].notna() & df["launch_angle"].notna()
+        df["is_barrel"] = (
+            has_ev
+            & (df["launch_speed"] >= 98)
+            & (df["launch_angle"].between(26, 30))
+        ).astype(int)
+
+    # swing / whiff flags
+    df["is_swing"] = df["description"].isin(SWING_DESCS).astype(int)
+    df["is_whiff"] = df["description"].isin(WHIFF_DESCS).astype(int)
+
+    # per-pitcher usage: group by (pitcher, game_date, pitch_type) to compute usage_pct
+    total_per_game = (
+        df.groupby(["pitcher", "game_date"])
+        .size()
+        .reset_index(name="total_pitches")
+    )
+    pitch_per_game = (
+        df.groupby(["pitcher", "game_date", "pitch_type"])
+        .size()
+        .reset_index(name="pitch_count")
+    )
+    usage_df = pitch_per_game.merge(total_per_game, on=["pitcher", "game_date"])
+    usage_df["usage_pct"] = usage_df["pitch_count"] / usage_df["total_pitches"]
+
+    # per-batter barrel/whiff: group by (batter, pitch_type)
+    batter_pt = df.groupby(["batter", "pitch_type"]).agg(
+        n=("pitch_type", "count"),
+        barrels=("is_barrel", "sum"),
+        swings=("is_swing", "sum"),
+        whiffs=("is_whiff", "sum"),
+    ).reset_index()
+    batter_pt = batter_pt[batter_pt["n"] >= 10]
+    batter_pt["barrel_rate"] = batter_pt["barrels"] / batter_pt["n"]
+    batter_pt["whiff_rate"] = np.where(
+        batter_pt["swings"] > 0,
+        batter_pt["whiffs"] / batter_pt["swings"],
+        0.0,
+    )
+
+    baselines = {}
+    for pt in df["pitch_type"].unique():
+        br = batter_pt[batter_pt["pitch_type"] == pt]["barrel_rate"]
+        wr = batter_pt[batter_pt["pitch_type"] == pt]["whiff_rate"]
+        up = usage_df[usage_df["pitch_type"] == pt]["usage_pct"]
+
+        baselines[pt] = {
+            "barrel_rate_mean": float(br.mean()) if len(br) else 0.05,
+            "barrel_rate_std": float(br.std()) if len(br) > 1 else 0.04,
+            "whiff_rate_mean": float(wr.mean()) if len(wr) else 0.25,
+            "whiff_rate_std": float(wr.std()) if len(wr) > 1 else 0.15,
+            "usage_pct_mean": float(up.mean()) if len(up) else 0.20,
+            "usage_pct_std": float(up.std()) if len(up) > 1 else 0.10,
+        }
+
+    return baselines
 
 
-def get_team_pitching_staff(team_id: int, season: int) -> list[dict]:
-    """
-    Return active pitchers for a team sorted by IP descending.
-    Each row: {player_id, name, role, ip, ip_float, era, whip, k, bb, gs, g}
-    role = 'SP' if gamesStarted > 0 else 'RP'.
-    """
-    try:
-        data = statsapi.get("team_roster", {"teamId": team_id})
-        pitchers = [p for p in data.get("roster", [])
-                    if p.get("position", {}).get("type") == "Pitcher"]
-        if not pitchers:
-            return []
-
-        ids_str = ",".join(str(p["person"]["id"]) for p in pitchers)
-        resp = statsapi.get("people", {
-            "personIds": ids_str,
-            "hydrate": f"stats(group=pitching,type=season,season={season})",
-        })
-    except Exception:
-        return []
-
-    rows = []
-    for person in resp.get("people", []):
-        pid  = person["id"]
-        name = person["fullName"]
-        for sg in person.get("stats", []):
-            for split in sg.get("splits", []):
-                s  = split.get("stat", {})
-                ip = s.get("inningsPitched", "0.0")
-                gs = int(s.get("gamesStarted", 0) or 0)
-                g  = int(s.get("gamesPlayed", 0) or 0)
-                k  = int(s.get("strikeOuts", 0) or 0)
-                bb = int(s.get("baseOnBalls", 0) or 0)
-                rows.append({
-                    "player_id":  pid,
-                    "name":       name,
-                    "role":       "SP" if gs > 0 else "RP",
-                    "ip":         ip,
-                    "ip_float":   _ip_to_float(ip),
-                    "era":        s.get("era", "-.--") or "-.--",
-                    "whip":       s.get("whip", "-.--") or "-.--",
-                    "k":          k,
-                    "bb":         bb,
-                    "gs":         gs,
-                    "g":          g,
-                })
-    # Sort SP first (by IP), then RP (by IP)
-    rows.sort(key=lambda r: (0 if r["role"] == "SP" else 1, -r["ip_float"]))
-    return rows
+def _fallback_baselines() -> dict:
+    """Hardcoded league averages when Statcast is unavailable."""
+    defaults = {
+        "FF": (0.055, 0.040, 0.220, 0.130, 0.340, 0.120),
+        "SI": (0.045, 0.038, 0.180, 0.115, 0.220, 0.100),
+        "FC": (0.040, 0.035, 0.230, 0.135, 0.130, 0.080),
+        "SL": (0.035, 0.030, 0.330, 0.150, 0.190, 0.100),
+        "ST": (0.030, 0.028, 0.360, 0.155, 0.110, 0.075),
+        "CU": (0.030, 0.028, 0.310, 0.145, 0.130, 0.090),
+        "KC": (0.028, 0.026, 0.290, 0.140, 0.080, 0.060),
+        "CH": (0.038, 0.032, 0.330, 0.155, 0.140, 0.090),
+        "FS": (0.032, 0.030, 0.350, 0.160, 0.060, 0.050),
+    }
+    out = {}
+    for pt, vals in defaults.items():
+        out[pt] = {
+            "barrel_rate_mean": vals[0],
+            "barrel_rate_std": vals[1],
+            "whiff_rate_mean": vals[2],
+            "whiff_rate_std": vals[3],
+            "usage_pct_mean": vals[4],
+            "usage_pct_std": vals[5],
+        }
+    return out
 
 
-def get_team_batting_leaders(team_id: int, season: int, n: int = 5) -> list[dict]:
-    """
-    Return the top n position players by OPS for a team.
-    Each row: {player_id, name, ops, avg, hr, pa}
-    """
-    try:
-        data = statsapi.get("team_roster", {"teamId": team_id})
-        batters = [p for p in data.get("roster", [])
-                   if p.get("position", {}).get("type") != "Pitcher"]
-        if not batters:
-            return []
+# ── player headshot ──────────────────────────────────────────────────────────
 
-        ids_str = ",".join(str(p["person"]["id"]) for p in batters)
-        resp = statsapi.get("people", {
-            "personIds": ids_str,
-            "hydrate": f"stats(group=hitting,type=season,season={season})",
-        })
-    except Exception:
-        return []
-
-    rows = []
-    for person in resp.get("people", []):
-        pid  = person["id"]
-        name = person["fullName"]
-        for sg in person.get("stats", []):
-            for split in sg.get("splits", []):
-                s   = split.get("stat", {})
-                ops = s.get("ops", "")
-                pa  = int(s.get("plateAppearances", 0) or 0)
-                if ops and ops not in (".000", "") and pa >= 10:
-                    try:
-                        ops_f = float(ops)
-                    except ValueError:
-                        continue
-                    rows.append({
-                        "player_id": pid,
-                        "name":      name,
-                        "ops":       ops_f,
-                        "avg":       s.get("avg", ".000"),
-                        "hr":        int(s.get("homeRuns", 0) or 0),
-                        "pa":        pa,
-                    })
-
-    rows.sort(key=lambda r: r["ops"], reverse=True)
-    return rows[:n]
-
-
-def get_league_avg_krate(season: int) -> float:
-    """
-    Return MLB league-average batter K% (per plate appearance, as a percentage).
-    Fetches from the stats API and falls back to 22.5 if unavailable.
-    """
-    try:
-        # Use league-level cumulative stats; sportId=1 = MLB
-        resp = statsapi.get("stats", {
-            "stats":   "season",
-            "group":   "hitting",
-            "sportId": 1,
-            "season":  season,
-            "limit":   1000,
-        })
-        total_k  = 0
-        total_pa = 0
-        for split in resp.get("stats", [{}])[0].get("splits", []):
-            s = split.get("stat", {})
-            total_k  += int(s.get("strikeOuts", 0)        or 0)
-            total_pa += int(s.get("plateAppearances", 0)  or 0)
-        if total_pa > 0:
-            return round(total_k / total_pa * 100, 2)
-    except Exception:
-        pass
-    return 22.5   # MLB historical avg 2023-2025
-
-
-def get_lineup_with_ids(game_id: int, side: str, team_id: int | None = None) -> list[dict]:
-    """
-    Return the confirmed batting lineup with player IDs for one side.
-    Falls back to the predicted lineup (names only, IDs looked up separately)
-    if the box score lineup is not yet posted.
-
-    Each row: {name, player_id, pos, slot}
-    """
-    from mlb_live.pipeline import get_live_box_score
-    try:
-        box = get_live_box_score(game_id)
-    except Exception:
-        return []
-
-    team_data = box.get(side, {})
-    players   = team_data.get("players", {})
-    batter_ids_ordered = team_data.get("batters", [])
-
-    rows = []
-    slot = 1
-    seen: set[str] = set()
-    for pid in batter_ids_ordered:
-        if slot > 9:
-            break
-        p    = players.get(f"ID{pid}", {})
-        name = p.get("person", {}).get("fullName", "")
-        pos  = p.get("position", {}).get("abbreviation", "")
-        s    = p.get("stats", {}).get("batting", {})
-        # Only include if they have at-bat data (confirmed in game)
-        if name and name not in seen:
-            seen.add(name)
-            rows.append({
-                "name":      name,
-                "player_id": pid,
-                "pos":       pos,
-                "slot":      slot,
-                "confirmed": bool(s),
-            })
-            slot += 1
-
-    return rows
+def get_player_headshot_url(player_id: int) -> str:
+    return (
+        f"https://img.mlbstatic.com/mlb-photos/image/upload/"
+        f"d_people:generic:headshot:67:current.png/w_213,q_auto:best/"
+        f"v1/people/{player_id}/headshot/67/current"
+    )

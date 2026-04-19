@@ -1,1092 +1,790 @@
 """
-MLB Live Tracker Dashboard — Full Edition
-Run with: streamlit run dashboard.py
+Baseball Matchup Tracker — Streamlit Dashboard
+Four tabs: Today · Matchup · Trends · History
+MAS (Matchup Advantage Score) is the headline metric.
 """
 
-import streamlit as st
+from __future__ import annotations
+
+import math
+from datetime import date
+
 import pandas as pd
-import plotly.graph_objects as go
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import streamlit as st
 
-# ── Core shared utilities ─────────────────────────────────────────────────────
-from core.config import ASTROS_ID, STAR_BATTERS, PITCH_NAMES
-from core.headshots import headshot_b64
-from core.player_lookup import lookup_player_id, get_pitcher_handedness
+# ── page config (must be first Streamlit call) ────────────────────────────────
 
-# ── MLB Live game pipeline ────────────────────────────────────────────────────
-from mlb_live.pipeline import (
-    get_all_teams, get_todays_game, get_upcoming_game,
-    get_live_box_score, get_linescore, get_current_play, get_game_summary,
-    build_inning_table, build_batting_table, build_pitching_table,
-    get_pitcher_live_pitches, compute_pitcher_fatigue,
-    get_win_probability_from_plays,
-    get_game_pitchers, get_active_pitcher,
-)
-from mlb_live.charts import (
-    plot_pitch_movement, plot_velocity_fade,
-    plot_fatigue_gauge, plot_win_probability,
-)
-
-# ── MLB Season stats pipeline ─────────────────────────────────────────────────
-from mlb_season.pipeline import (
-    get_last_n_completed_games, aggregate_batting_stats, aggregate_pitching_stats,
-    predict_lineup, get_batter_game_log, get_pitcher_game_log,
-    fetch_statcast_csv, get_pitcher_arsenal, get_batter_pitch_splits,
-    get_batter_career_pitch_splits,
-    get_batter_hot_zones, get_barrel_trend,
-    get_lineup_with_ids, get_team_pitching_staff, get_team_batting_leaders,
-    get_league_avg_krate,
-)
-from mlb_season.charts import (
-    plot_matchup_heatmap, plot_hot_zone_grid,
-    plot_rolling_ops, plot_krate_chart, plot_barrel_trend,
-    show_pitch_mix_simulator,
-    plot_career_pitch_splits, plot_pitch_type_season_trend,
-    plot_career_splits_table_fig,
-)
-
-CT = ZoneInfo("America/Chicago")
-
-
-def _show_mlb_headshot(player_id: int, width: int = 80):
-    """Display an MLB player headshot fetched as base64 (avoids CDN hot-link blocks)."""
-    b64 = headshot_b64(player_id, size=width)
-    if b64:
-        st.image(b64, width=width)
-    else:
-        st.markdown(f'<div style="width:{width}px;height:{width}px;'
-                    f'background:#1a2a4a;border-radius:50%;display:flex;'
-                    f'align-items:center;justify-content:center;'
-                    f'color:#aaa;font-size:1.6rem">⚾</div>',
-                    unsafe_allow_html=True)
-
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="MLB Live Tracker",
+    page_title="Baseball Matchup Tracker",
     page_icon="⚾",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-st.markdown("""
+# ── consolidated CSS ──────────────────────────────────────────────────────────
+
+st.markdown(
+    """
 <style>
-  .score-box { border:2px solid #EB6E1F; border-radius:10px;
-               padding:0.7rem 1.4rem; text-align:center; }
-  .score-num { font-size:2.8rem; font-weight:800; color:#EB6E1F; }
-  .team-name { font-size:0.95rem; font-weight:600; }
-  .status-badge { background:#EB6E1F; color:white; border-radius:20px;
-                  padding:3px 12px; font-weight:700; font-size:0.82rem; display:inline-block; }
-  .sec-hdr { font-size:0.95rem; font-weight:700; color:#EB6E1F;
-             border-bottom:1px solid #EB6E1F44; margin-bottom:0.4rem; padding-bottom:2px; }
-  .base-on  { color:#EB6E1F; font-size:1.5rem; }
-  .base-off { color:#333;    font-size:1.5rem; }
+/* ── base ── */
+[data-testid="stAppViewContainer"] { background: #0e1117; }
+[data-testid="stHeader"] { background: #0e1117; }
+h1, h2, h3 { color: #fafafa; }
+p, li { color: #ccc; }
+
+/* ── MAS card ── */
+.mas-card {
+    border: 1px solid #2a2a2a;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+    background: #0e1117;
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+}
+.mas-card-body { flex: 1; }
+.mas-player-name {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #fafafa;
+    margin: 0;
+}
+.mas-matchup-line {
+    font-size: 0.82rem;
+    color: #888;
+    margin: 2px 0 6px;
+}
+.mas-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 4px;
+}
+.mas-bar-container {
+    flex: 1;
+    height: 10px;
+    background: #2a2a2a;
+    border-radius: 6px;
+    overflow: hidden;
+}
+.mas-bar-fill { height: 100%; transition: width 0.3s ease; }
+.mas-strong-advantage    { background: #2ecc71; }
+.mas-slight-advantage    { background: #95d35d; }
+.mas-slight-disadvantage { background: #f39c12; }
+.mas-strong-disadvantage { background: #e74c3c; }
+.mas-number {
+    font-size: 1.1rem;
+    font-weight: 800;
+    min-width: 38px;
+    text-align: right;
+    color: #fafafa;
+}
+.mas-meta-row {
+    display: flex;
+    gap: 16px;
+    margin-top: 4px;
+}
+.mas-whiff-badge {
+    font-size: 0.78rem;
+    color: #aaa;
+}
+.driver-pill {
+    font-size: 0.78rem;
+    color: #EB6E1F;
+}
+.volatile-tag {
+    font-size: 0.7rem;
+    background: #3a2a1a;
+    color: #f39c12;
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+}
+
+/* ── Lineup Leverage banner ── */
+.leverage-banner {
+    background: linear-gradient(90deg, #1a2a4a 0%, #2a1a4a 100%);
+    border-left: 4px solid #EB6E1F;
+    padding: 12px 18px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+}
+.leverage-title {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #EB6E1F;
+    margin-bottom: 4px;
+    letter-spacing: 0.06em;
+}
+.leverage-line {
+    font-size: 0.88rem;
+    color: #ddd;
+    margin: 2px 0;
+}
+
+/* ── score header (live) ── */
+.score-header {
+    text-align: center;
+    padding: 16px 0 8px;
+}
+.score-teams {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #fafafa;
+    letter-spacing: 0.04em;
+}
+.score-numbers {
+    font-size: 2.8rem;
+    font-weight: 900;
+    color: #EB6E1F;
+    line-height: 1.1;
+}
+.score-situation {
+    font-size: 0.88rem;
+    color: #888;
+    margin-top: 4px;
+}
+
+/* ── current batter MAS chip (live tab) ── */
+.live-mas-chip {
+    background: #16213e;
+    border: 1px solid #2a2a4a;
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.live-mas-label {
+    font-size: 0.78rem;
+    color: #888;
+    margin-bottom: 2px;
+}
+.live-mas-value {
+    font-size: 1.6rem;
+    font-weight: 900;
+}
+
+/* ── tab styling ── */
+[data-testid="stTabs"] button {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #aaa;
+}
+[data-testid="stTabs"] button[aria-selected="true"] {
+    color: #EB6E1F;
+    border-bottom-color: #EB6E1F;
+}
+
+/* ── generic divider ── */
+hr { border-color: #2a2a2a; margin: 12px 0; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚾ MLB Live Tracker")
-    st.markdown("---")
+# ── imports (after page config) ───────────────────────────────────────────────
 
-    @st.cache_data(ttl=3600)
-    def load_teams():
-        return get_all_teams()
-
-    teams     = load_teams()
-    team_map  = {t["name"]: t["id"] for t in teams}
-    default_i = next((i for i, t in enumerate(teams) if t["id"] == ASTROS_ID), 0)
-    sel_team  = st.selectbox("Team", list(team_map.keys()), index=default_i)
-    team_id   = team_map[sel_team]
-
-    st.markdown("---")
-    st.caption(f"Last refresh: {datetime.now(CT).strftime('%-I:%M %p CT')}")
-    if st.button("🔄 Refresh"):
-        st.cache_data.clear()
-        st.rerun()
-
-# ── Helper: formatted score header ───────────────────────────────────────────
-def _score_header(s: dict, team_id: int):
-    ca, cm, ch = st.columns([3, 2, 3])
-    status = s["status"]
-    is_live  = status in ("In Progress", "Manager challenge")
-    is_final = "Final" in status
-
-    with ca:
-        st.markdown(f"""<div class="score-box">
-            <div class="team-name">{s['away_name']}</div>
-            <div class="score-num">{s['away_score']}</div>
-        </div>""", unsafe_allow_html=True)
-    with cm:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if is_live:
-            badge = f"{s['inning_state']} {s['inning']}"
-        elif is_final:
-            badge = "Final"
-        else:
-            try:
-                dt = datetime.fromisoformat(s["game_datetime"].replace("Z", "+00:00")).astimezone(CT)
-                badge = dt.strftime("%-I:%M %p CT")
-            except Exception:
-                badge = "Today"
-        st.markdown(f'<div style="text-align:center"><span class="status-badge">{badge}</span></div>',
-                    unsafe_allow_html=True)
-        st.markdown(f'<p style="text-align:center;color:#aaa;font-size:0.78rem;margin-top:4px">'
-                    f'{s["venue"]}</p>', unsafe_allow_html=True)
-    with ch:
-        st.markdown(f"""<div class="score-box">
-            <div class="team-name">{s['home_name']}</div>
-            <div class="score-num">{s['home_score']}</div>
-        </div>""", unsafe_allow_html=True)
+from core.matchup_score import (
+    compute_matchup_score,
+    mas_color,
+    mas_css_class,
+    mas_label,
+)
+from core.player_lookup import (
+    get_player_info,
+    get_player_name,
+    get_pitcher_handedness,
+    get_team_roster,
+)
+from core.visualizations import (
+    plot_career_pitch_splits,
+    plot_hot_zone_grid,
+    plot_per_pitch_breakdown,
+    show_pitch_mix_simulator,
+)
+from mlb_season.pipeline import (
+    get_game_lineup,
+    get_live_game_data,
+    get_pitcher_arsenal,
+    get_player_headshot_url,
+    get_probable_lineups,
+    get_todays_games,
+)
 
 
-# ── Helper: lineup-or-prediction column ──────────────────────────────────────
-def _lineup_col(box, side, tid, label):
-    batters = box.get(side, {}).get("batters", []) if box else []
-    if len(batters) >= 9:
-        st.markdown(f'<div class="sec-hdr">{label} — Confirmed</div>', unsafe_allow_html=True)
-        df = build_batting_table(box, side)
-        st.dataframe(df.head(9), use_container_width=True, hide_index=True)
+# ── session state defaults ────────────────────────────────────────────────────
+
+def _init_state():
+    defaults = {
+        "selected_game_pk": None,
+        "selected_pitcher_id": None,
+        "selected_team_id": None,
+        "active_tab": "Today",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+_init_state()
+
+# ── header ────────────────────────────────────────────────────────────────────
+
+st.markdown(
+    "<h1 style='margin-bottom:0'>⚾ Baseball Matchup Tracker</h1>"
+    f"<p style='color:#888;margin-top:2px'>{date.today().strftime('%A, %B %-d, %Y')}</p>",
+    unsafe_allow_html=True,
+)
+
+# ── tabs ──────────────────────────────────────────────────────────────────────
+
+tab_today, tab_matchup, tab_trends, tab_history = st.tabs(
+    ["🔴 Today", "🎯 Matchup", "📈 Trends", "📋 History"]
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — TODAY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_today:
+    games = get_todays_games()
+
+    if not games:
+        st.info("No games scheduled today.")
     else:
-        st.markdown(f'<div class="sec-hdr">{label} — Projected</div>', unsafe_allow_html=True)
-        st.caption("Lineup not posted — projecting from last 5 games.")
-        pred = predict_lineup(tid, n_games=5)
-        if not pred.empty:
-            st.dataframe(pred, use_container_width=True, hide_index=True)
-        else:
-            st.caption("Insufficient history.")
+        # ── game selector ─────────────────────────────────────────────────────
+        def _game_label(g: dict) -> str:
+            score = ""
+            if g["status"] in ("In Progress", "Final", "Game Over"):
+                score = f"  {g['away_score']}–{g['home_score']}"
+            status_icon = {
+                "In Progress": "🔴",
+                "Final": "✅",
+                "Game Over": "✅",
+                "Pre-Game": "🕐",
+                "Warmup": "🕐",
+                "Preview": "📅",
+            }.get(g["status"], "📅")
+            return f"{status_icon}  {g['away_team']}  @  {g['home_team']}{score}"
 
+        game_labels = [_game_label(g) for g in games]
+        sel_idx = 0
+        if st.session_state.selected_game_pk:
+            for i, g in enumerate(games):
+                if g["game_pk"] == st.session_state.selected_game_pk:
+                    sel_idx = i
+                    break
 
-# ── Page header ───────────────────────────────────────────────────────────────
-st.markdown(f"## {sel_team}")
-
-# ── Main tabs ─────────────────────────────────────────────────────────────────
-(tab_live, tab_scout, tab_pitching,
- tab_trends, tab_l3, tab_stats, tab_next) = st.tabs([
-    "🔴 Live", "🎯 Scout", "📡 Pitching",
-    "📈 Trends", "📋 Last 3", "📊 L3 Stats", "🔮 Up Next",
-])
-
-# ── Safe defaults — overwritten in tab_live if a game exists ─────────────────
-# Defining here ensures downstream tabs never hit NameError when there's no game.
-game    = None
-s       = None
-game_id = None
-status  = "None"
-is_live = is_final = is_pre = False
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🔴 LIVE TAB
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_live:
-    with st.spinner("Loading today's game…"):
-        game = get_todays_game(team_id)
-
-    if not game:
-        st.info("No game today. Check **Up Next** tab.")
-    else:
-        s         = get_game_summary(game)
-        game_id   = s["game_id"]
-        status    = s["status"]
-        is_live   = status in ("In Progress", "Manager challenge")
-        is_final  = "Final" in status
-        is_pre    = not is_live and not is_final
-
-        _score_header(s, team_id)
-        st.markdown("---")
-
-        team_side = "home" if s["home_id"] == team_id else "away"
-        opp_side  = "away" if team_side == "home" else "home"
-        opp_id    = s["away_id"] if team_side == "home" else s["home_id"]
-        opp_name  = s["away_name"] if team_side == "home" else s["home_name"]
-
-        # ── Pre-game ──────────────────────────────────────────────────────────
-        if is_pre:
-            pc1, pc2 = st.columns(2)
-            pc1.metric(f"{s['away_name']} SP", s["away_probable_pitcher"])
-            pc2.metric(f"{s['home_name']} SP", s["home_probable_pitcher"])
-            st.markdown("---")
-            try:
-                pre_box = get_live_box_score(game_id)
-                lc1, lc2 = st.columns(2)
-                with lc1:
-                    _lineup_col(pre_box, team_side, team_id,   sel_team)
-                with lc2:
-                    _lineup_col(pre_box, opp_side,  opp_id,    opp_name)
-            except Exception as e:
-                st.caption(f"Pre-game lineups unavailable: {e}")
-
-        # ── In-progress / Final ───────────────────────────────────────────────
-        else:
-            try:
-                box       = get_live_box_score(game_id)
-                linescore = get_linescore(game_id)
-
-                # Current at-bat + baserunners (live only)
-                if is_live:
-                    cp = get_current_play(game_id)
-                    if cp:
-                        mi  = cp.get("matchup", {})
-                        cnt = cp.get("count", {})
-                        r1  = bool(mi.get("postOnFirst"))
-                        r2  = bool(mi.get("postOnSecond"))
-                        r3  = bool(mi.get("postOnThird"))
-
-                        col_ab, col_bases = st.columns([3, 1])
-                        with col_ab:
-                            c1, c2, c3, c4 = st.columns(4)
-                            c1.metric("Batter",  mi.get("batter",  {}).get("fullName", "—"))
-                            c2.metric("Pitcher", mi.get("pitcher", {}).get("fullName", "—"))
-                            c3.metric("Count",   f"{cnt.get('balls',0)}-{cnt.get('strikes',0)}")
-                            c4.metric("Outs",    cnt.get("outs", 0))
-                            desc = cp.get("result", {}).get("description", "")
-                            if desc:
-                                st.caption(desc)
-                        with col_bases:
-                            # Diamond visual
-                            st.markdown(f"""
-                            <div style="text-align:center;line-height:1.2">
-                              <span class="{'base-on' if r2 else 'base-off'}">◆</span><br>
-                              <span class="{'base-on' if r3 else 'base-off'}">◆</span>
-                              &nbsp;&nbsp;
-                              <span class="{'base-on' if r1 else 'base-off'}">◆</span><br>
-                              <span style="color:#555">◆</span>
-                            </div>""", unsafe_allow_html=True)
-                        st.markdown("---")
-
-                # Win probability
-                wp_data = get_win_probability_from_plays(game_id, home_team=s["home_name"])
-                if wp_data:
-                    wp_fig = plot_win_probability(wp_data, home_team=s["home_name"])
-                    st.plotly_chart(wp_fig, use_container_width=True)
-                    st.markdown("---")
-
-                # Linescore
-                st.markdown('<div class="sec-hdr">Linescore</div>', unsafe_allow_html=True)
-                inn_df = build_inning_table(linescore)
-                if not inn_df.empty:
-                    ta = linescore.get("teams", {}).get("away", {})
-                    th = linescore.get("teams", {}).get("home", {})
-                    hdrs   = ["Team"] + [str(r) for r in inn_df["Inning"]] + ["R", "H", "E"]
-                    away_r = [s["away_name"]] + list(inn_df["Away"]) + [
-                        ta.get("runs",0), ta.get("hits",0), ta.get("errors",0)]
-                    home_r = [s["home_name"]] + list(inn_df["Home"]) + [
-                        th.get("runs",0), th.get("hits",0), th.get("errors",0)]
-                    st.dataframe(pd.DataFrame([away_r, home_r], columns=hdrs),
-                                 use_container_width=True, hide_index=True)
-                st.markdown("---")
-
-                # Batting / Pitching
-                st.markdown('<div class="sec-hdr">Batting</div>', unsafe_allow_html=True)
-                bt1, bt2 = st.tabs([sel_team, opp_name])
-                with bt1:
-                    df = build_batting_table(box, team_side)
-                    if not df.empty:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No at-bats yet.")
-                with bt2:
-                    df = build_batting_table(box, opp_side)
-                    if not df.empty:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("Lineup not in box score — showing projection.")
-                        pred = predict_lineup(opp_id, n_games=5)
-                        if not pred.empty:
-                            st.dataframe(pred, use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("Insufficient history.")
-
-                st.markdown('<div class="sec-hdr">Pitching</div>', unsafe_allow_html=True)
-                pt1, pt2 = st.tabs([sel_team, opp_name])
-                with pt1:
-                    df = build_pitching_table(box, team_side)
-                    if not df.empty:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No pitching data.")
-                with pt2:
-                    df = build_pitching_table(box, opp_side)
-                    if not df.empty:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No pitching data.")
-
-            except Exception as e:
-                st.error(f"Error loading game details: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🎯 SCOUT TAB
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_scout:
-    st.markdown("### Pitch Matchup Scouting")
-
-    # ── Pitcher selection ─────────────────────────────────────────────────────
-    with st.expander("Pitcher Selection", expanded=True):
-        col_ps, col_pm = st.columns([2, 1])
-        with col_ps:
-            pitcher_input = st.text_input(
-                "Opposing Pitcher Name",
-                value=(s["away_probable_pitcher"] if game and s["home_id"] == team_id
-                       else s["home_probable_pitcher"] if game else ""),
-                key=f"scout_pitcher_name_{team_id}",
-            )
-
-        pitcher_id   = None
-        pitcher_hand = "?"
-        if pitcher_input and pitcher_input not in ("TBD", ""):
-            with st.spinner(f"Looking up {pitcher_input}…"):
-                pitcher_id = lookup_player_id(pitcher_input)
-            if pitcher_id:
-                pitcher_hand = get_pitcher_handedness(pitcher_id)
-                hand_color   = "#e74c3c" if pitcher_hand == "R" else "#3498db" if pitcher_hand == "L" else "#9b59b6"
-                col_hs, col_pi = st.columns([1, 3])
-                with col_hs:
-                    _show_mlb_headshot(pitcher_id, width=80)
-                with col_pi:
-                    st.markdown(
-                        f"**{pitcher_input}** &nbsp;"
-                        f'<span style="background:{hand_color};color:white;border-radius:6px;'
-                        f'padding:2px 10px;font-size:0.78rem;font-weight:700">Throws {pitcher_hand}</span>',
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.warning(f"Could not find '{pitcher_input}' in MLB database.")
-
-    # ── Load pitcher arsenal ──────────────────────────────────────────────────
-    pitcher_arsenal = pd.DataFrame()
-    if pitcher_id:
-        with st.spinner("Loading pitcher arsenal…"):
-            pitcher_arsenal = get_pitcher_arsenal(pitcher_id)
-        if not pitcher_arsenal.empty:
-            st.markdown('<div class="sec-hdr">Pitcher Arsenal</div>', unsafe_allow_html=True)
-            disp_cols = ["pitch_name", "usage_pct", "avg_velo", "avg_spin", "avg_h_break", "avg_v_break"]
-            disp_cols = [c for c in disp_cols if c in pitcher_arsenal.columns]
-            st.dataframe(
-                pitcher_arsenal[disp_cols].rename(columns={
-                    "pitch_name": "Pitch", "usage_pct": "Usage%",
-                    "avg_velo": "Velo", "avg_spin": "Spin",
-                    "avg_h_break": "H Break", "avg_v_break": "V Break",
-                }).round(1),
-                use_container_width=True, hide_index=True,
-            )
-
-    st.markdown("---")
-
-    # ── Batter selection ──────────────────────────────────────────────────────
-    # Priority: confirmed game lineup → predicted lineup → star batters fallback
-    # pre_batter_ids maps name → player_id for names sourced from the box score
-    pre_batter_ids: dict[str, int] = {}
-
-    lineup_rows: list[dict] = []
-    if game:
-        ts = "home" if s["home_id"] == team_id else "away"
-        try:
-            lineup_rows = get_lineup_with_ids(game_id, ts)
-        except Exception:
-            lineup_rows = []
-
-    if lineup_rows:
-        # Confirmed or partial confirmed lineup from box score
-        lineup_source = "Confirmed" if any(r["confirmed"] for r in lineup_rows) else "Partial"
-        for r in lineup_rows:
-            pre_batter_ids[r["name"]] = r["player_id"]
-        default_batters = [r["name"] for r in lineup_rows]
-        source_label    = f"Today's Lineup ({lineup_source})"
-    else:
-        # No box score yet — fall back to predict_lineup
-        try:
-            pred_df = predict_lineup(team_id, n_games=5)
-            predicted_names = pred_df["Projected Player"].tolist() if not pred_df.empty else []
-        except Exception:
-            predicted_names = []
-        default_batters = [n for n in predicted_names if n and n != "Insufficient data"][:9]
-        source_label    = "Projected Lineup"
-
-    # Build options: box-score lineup first, then projected names, then star batters
-    all_batter_options = list(pre_batter_ids.keys())
-    for name in default_batters:                   # add projected names not already present
-        if name not in all_batter_options:
-            all_batter_options.append(name)
-    for name in STAR_BATTERS:                      # star batters as extra options
-        if name not in all_batter_options:
-            all_batter_options.append(name)
-
-    if default_batters:
-        st.caption(f"Auto-populated from: **{source_label}**. Adjust below as needed.")
-
-    sel_batters = st.multiselect(
-        "Batters (for matchup analysis)",
-        all_batter_options,
-        default=[b for b in default_batters if b in all_batter_options],
-        key=f"scout_batters_{team_id}",
-    )
-
-    if not sel_batters:
-        st.info("Select at least one batter above.")
-    else:
-        # ── Load batter splits ────────────────────────────────────────────────
-        batters_splits: dict[str, pd.DataFrame] = {}
-        batter_ids: dict[str, int] = {}
-
-        with st.spinner("Loading batter pitch splits…"):
-            for name in sel_batters:
-                # Box-score ID → STAR_BATTERS dict → name lookup
-                bid = pre_batter_ids.get(name) or STAR_BATTERS.get(name) or lookup_player_id(name)
-                if bid:
-                    batter_ids[name]     = bid
-                    batters_splits[name] = get_batter_pitch_splits(bid)
-
-        if not any(not df.empty for df in batters_splits.values()):
-            st.warning("No pitch split data found for selected batters.")
-        else:
-            # ── Matchup heatmap ───────────────────────────────────────────────
-            hm_fig = plot_matchup_heatmap(batters_splits, pitcher_arsenal)
-            st.plotly_chart(hm_fig, use_container_width=True)
-
-            # ── Hot zone grid per batter ──────────────────────────────────────
-            st.markdown("---")
-            st.markdown("### Strike Zone Hot Zones")
-            hz_batter = st.selectbox("Select Batter for Hot Zone", list(batter_ids.keys()),
-                                      key=f"hz_batter_{team_id}")
-            if hz_batter and hz_batter in batter_ids:
-                with st.spinner(f"Loading hot zones for {hz_batter}…"):
-                    hot_zones = get_batter_hot_zones(batter_ids[hz_batter])
-                    pitcher_locs = (
-                        get_pitcher_arsenal(pitcher_id)[["pitch_type", "avg_x", "avg_z", "usage_pct", "pitch_name"]]
-                        if pitcher_id and not pitcher_arsenal.empty
-                        else None
-                    )
-
-                hc1, hc2 = st.columns([1, 5])
-                with hc1:
-                    _show_mlb_headshot(batter_ids[hz_batter], width=80)
-                with hc2:
-                    st.markdown(f"**{hz_batter}** — xBA by Zone")
-
-                hz_fig = plot_hot_zone_grid(
-                    hot_zones, pitcher_locs,
-                    title=f"{hz_batter} — Hot Zones + {pitcher_input or 'Pitcher'} Pitch Locations",
-                )
-                st.plotly_chart(hz_fig, use_container_width=True)
-
-            # ── Pitch mix simulator ───────────────────────────────────────────
-            st.markdown("---")
-            st.markdown("### Pitch Mix Simulator")
-            st.caption(
-                "Adjust the sliders to change the pitcher's pitch mix. "
-                "Adj Barrel% and Base Barrel% are identical until you move a slider — "
-                "that is expected, as sliders start at the pitcher's actual usage rates."
-            )
-            show_pitch_mix_simulator(batters_splits, pitcher_arsenal, key_prefix="sim")
-
-        # ── Career / multi-season pitch-type splits ───────────────────────────
-        st.markdown("---")
-        with st.expander("📊 Career Pitch-Type Splits — larger sample size", expanded=False):
-            st.markdown(
-                "Aggregates Statcast data across multiple seasons so you can see how "
-                "a batter *actually* performs against each pitch type over a bigger sample. "
-                "Great for spotting weaknesses like **Ohtani vs sliders** or "
-                "**Freeman vs breaking balls**."
-            )
-
-            import datetime as _dt_career
-            _cur_yr = _dt_career.date.today().year
-
-            # Season range selector
-            career_col1, career_col2 = st.columns([2, 1])
-            with career_col1:
-                avail_seasons = list(range(_cur_yr - 4, _cur_yr + 1))
-                sel_seasons   = st.multiselect(
-                    "Seasons to include",
-                    avail_seasons,
-                    default=[_cur_yr - 2, _cur_yr - 1, _cur_yr],
-                    key=f"career_seasons_{team_id}",
-                )
-            with career_col2:
-                career_batter = st.selectbox(
-                    "Batter to analyse",
-                    list(batter_ids.keys()) if batter_ids else list(STAR_BATTERS.keys()),
-                    key=f"career_batter_{team_id}",
-                )
-
-            if not sel_seasons:
-                st.warning("Select at least one season.")
-            else:
-                # Look up ID — box score first, then STAR_BATTERS, then name lookup
-                career_bid = (
-                    batter_ids.get(career_batter)
-                    or STAR_BATTERS.get(career_batter)
-                    or lookup_player_id(career_batter)
-                )
-                if not career_bid:
-                    st.warning(f"Could not resolve player ID for **{career_batter}**.")
-                else:
-                    seasons_tuple = tuple(sorted(sel_seasons))
-                    season_label  = (
-                        f"{seasons_tuple[0]}–{seasons_tuple[-1]}"
-                        if len(seasons_tuple) > 1 else str(seasons_tuple[0])
-                    )
-                    with st.spinner(
-                        f"Fetching {season_label} Statcast data for {career_batter}…"
-                    ):
-                        career_df, by_season_df = get_batter_career_pitch_splits(
-                            career_bid, seasons=seasons_tuple
-                        )
-
-                    if career_df.empty:
-                        st.info(
-                            f"No Statcast data found for {career_batter} "
-                            f"in seasons {seasons_tuple}."
-                        )
-                    else:
-                        total_pitches = career_df["pitches"].sum() if "pitches" in career_df.columns else 0
-                        st.caption(
-                            f"**{career_batter}** · {season_label} · "
-                            f"{total_pitches:,} total pitches across "
-                            f"{len(career_df)} pitch types"
-                        )
-
-                        # ── Colour-coded stats table ──────────────────────────
-                        tbl_fig = plot_career_splits_table_fig(career_df, career_batter)
-                        st.plotly_chart(tbl_fig, use_container_width=True)
-
-                        # ── Grouped bar overview ──────────────────────────────
-                        bar_fig = plot_career_pitch_splits(career_df, career_batter)
-                        st.plotly_chart(bar_fig, use_container_width=True)
-
-                        # ── Per-pitch-type deep dive (season-by-season) ───────
-                        if not by_season_df.empty and by_season_df["season"].nunique() >= 2:
-                            st.markdown("#### Year-over-Year Trend by Pitch Type")
-                            pitch_name_options = career_df["pitch_name"].tolist()
-                            dive_pitch = st.selectbox(
-                                "Select pitch type for season-by-season breakdown",
-                                pitch_name_options,
-                                key=f"career_dive_pitch_{team_id}_{career_batter}",
-                            )
-                            if dive_pitch:
-                                trend_fig = plot_pitch_type_season_trend(
-                                    by_season_df, dive_pitch, career_batter
-                                )
-                                st.plotly_chart(trend_fig, use_container_width=True)
-
-                                # Raw numbers table
-                                dive_rows = by_season_df[
-                                    by_season_df["pitch_name"] == dive_pitch
-                                ].sort_values("season")
-                                if not dive_rows.empty:
-                                    show_cols = [c for c in [
-                                        "season", "pitches", "whiff_rate", "k_rate",
-                                        "barrel_rate", "hard_hit_rate", "avg_ev", "xba", "xwoba"
-                                    ] if c in dive_rows.columns]
-                                    st.dataframe(
-                                        dive_rows[show_cols].rename(columns={
-                                            "season": "Season",
-                                            "pitches": "Pitches",
-                                            "whiff_rate": "Whiff%",
-                                            "k_rate": "K%",
-                                            "barrel_rate": "Barrel%",
-                                            "hard_hit_rate": "Hard Hit%",
-                                            "avg_ev": "Avg EV",
-                                            "xba": "xBA",
-                                            "xwoba": "xwOBA",
-                                        }).round(3),
-                                        use_container_width=True,
-                                        hide_index=True,
-                                    )
-                        elif not by_season_df.empty:
-                            st.caption(
-                                "Select 2+ seasons above to enable year-over-year trend view."
-                            )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📡 PITCHING TAB
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_pitching:
-    st.markdown("### Live Pitching Analysis")
-
-    live_game   = get_todays_game(team_id)
-    live_s      = get_game_summary(live_game) if live_game else None
-    live_id     = live_s["game_id"] if live_s else None
-    live_status = live_s["status"] if live_s else "None"
-    is_active   = live_status in ("In Progress", "Manager challenge", "Final")
-
-    import datetime as _dt_pit
-    _pit_season = _dt_pit.date.today().year
-
-    # ── Determine team sides ──────────────────────────────────────────────────
-    if live_s:
-        t_side        = "home" if live_s["home_id"] == team_id else "away"
-        opp_s         = "away" if t_side == "home" else "home"
-        opp_name_pit  = live_s["away_name"] if t_side == "home" else live_s["home_name"]
-        opp_team_id   = live_s["away_id"]   if t_side == "home" else live_s["home_id"]
-    else:
-        t_side = opp_s = opp_name_pit = None
-        opp_team_id = None
-
-    # ── Team selector ─────────────────────────────────────────────────────────
-    team_choices = [sel_team]
-    if opp_name_pit:
-        team_choices.append(opp_name_pit)
-    pit_team_label = st.radio("Team", team_choices, horizontal=True, key=f"pit_team_radio_{team_id}")
-    analyze_team_id = team_id if pit_team_label == sel_team else (opp_team_id or team_id)
-    analyze_side    = (t_side if pit_team_label == sel_team else opp_s) if live_s else None
-
-    # ── Load season pitching staff (always) ───────────────────────────────────
-    with st.spinner(f"Loading {pit_team_label} pitching staff…"):
-        season_staff: list[dict] = get_team_pitching_staff(analyze_team_id, _pit_season)
-
-    # ── Also load today's game pitchers (for in-progress / final games) ───────
-    game_pitchers: list[dict] = []
-    active_pit: dict | None   = None
-    if live_id and is_active and analyze_side:
-        game_pitchers = get_game_pitchers(live_id, analyze_side)
-        active_pit    = get_active_pitcher(live_id)
-
-    # Build quick lookup: player_id → today's box-score row
-    today_pit_map = {p["pitcher_id"]: p for p in game_pitchers}
-
-    # Active pitcher on mound right now
-    half_for_side = "top" if analyze_side == "away" else "bottom"
-    active_id = (
-        active_pit["pitcher_id"]
-        if active_pit and active_pit.get("half") == half_for_side
-        else None
-    )
-
-    # ── Pitcher selector dropdown ─────────────────────────────────────────────
-    focus_pid:        int | None = None
-    focus_sp:         str        = ""
-    focus_role:       str        = "?"
-    focus_season_row: dict       = {}
-    focus_today_row:  dict       = {}
-
-    if season_staff:
-        def _staff_label(p: dict) -> str:
-            active_marker = "🟢 NOW  " if p["player_id"] == active_id else ""
-            today         = today_pit_map.get(p["player_id"])
-            today_tag     = f"  |  Today: {today['ip']} IP {today['pitches_thrown']}P" if today else ""
-            return (
-                f"{active_marker}{p['name']} [{p['role']}]"
-                f"  —  {p['ip']} IP  {p['era']} ERA{today_tag}"
-            )
-
-        label_map = {_staff_label(p): p for p in season_staff}
-
-        # Default: active pitcher → else probable starter → else first entry
-        probable_name = ""
-        if live_s and analyze_side:
-            probable_name = (
-                live_s.get("home_probable_pitcher", "")
-                if analyze_side == "home"
-                else live_s.get("away_probable_pitcher", "")
-            ) or ""
-
-        default_idx = 0
-        for i, (lbl, p) in enumerate(label_map.items()):
-            if p["player_id"] == active_id:
-                default_idx = i; break
-            if probable_name and probable_name.lower() in p["name"].lower():
-                default_idx = i
-
-        sel_label    = st.selectbox(
-            "Pitcher (season staff, sorted by IP)", list(label_map.keys()),
-            index=default_idx, key=f"pit_select_{team_id}",
+        chosen_idx = st.selectbox(
+            "Select game", range(len(games)),
+            format_func=lambda i: game_labels[i],
+            index=sel_idx,
+            key="today_game_sel",
         )
-        sel_row       = label_map[sel_label]
-        focus_pid     = sel_row["player_id"]
-        focus_sp      = sel_row["name"]
-        focus_role    = sel_row["role"]
-        focus_season_row = sel_row
-        focus_today_row  = today_pit_map.get(focus_pid, {})
+        game = games[chosen_idx]
+        st.session_state.selected_game_pk = game["game_pk"]
 
-    else:
-        # Roster fetch failed — manual fallback
-        fallback_name = ""
-        if live_s and analyze_side:
-            fallback_name = (
-                live_s.get("home_probable_pitcher", "")
-                if analyze_side == "home"
-                else live_s.get("away_probable_pitcher", "")
-            ) or ""
-        focus_sp = st.text_input("Pitcher name", value=fallback_name, key=f"pit_manual_{team_id}")
-        if focus_sp and focus_sp not in ("TBD", ""):
-            with st.spinner(f"Looking up {focus_sp}…"):
-                focus_pid = lookup_player_id(focus_sp)
-        focus_role = "SP"
+        is_live = game["status"] in ("In Progress", "Warmup", "Pre-Game")
+        is_final = "Final" in game["status"] or "Game Over" in game["status"]
 
-    # ── Analysis panel ────────────────────────────────────────────────────────
-    if not focus_pid:
-        st.info("No pitcher selected. Enter a name above or wait for the game to start.")
-    else:
-        # Fetch handedness from MLB API (not a manual dropdown)
-        with st.spinner("Fetching pitcher info…"):
-            hand = get_pitcher_handedness(focus_pid)
+        # ── score header ──────────────────────────────────────────────────────
+        if is_live or is_final:
+            live = get_live_game_data(game["game_pk"])
+            away_score = live.get("away_score", game["away_score"])
+            home_score = live.get("home_score", game["home_score"])
+            inning = live.get("inning", game.get("inning", 0))
+            inning_state = live.get("inning_state", game.get("inning_state", ""))
+            situation = (
+                f"{inning_state} {inning}" if inning else game["status"]
+            )
+        else:
+            away_score = home_score = "–"
+            situation = game.get("game_datetime", game["status"])
+            live = {}
 
-        # Role / hand pill styles
-        role_color = "#2196F3" if focus_role == "SP" else "#FF9800"
-        hand_color = "#e74c3c" if hand == "R" else "#3498db" if hand == "L" else "#9b59b6"
+        st.markdown(
+            f"""
+<div class="score-header">
+  <div class="score-teams">{game['away_team']} @ {game['home_team']}</div>
+  <div class="score-numbers">{away_score} – {home_score}</div>
+  <div class="score-situation">{situation}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
-        hs_col, info_col = st.columns([1, 5])
-        with hs_col:
-            _show_mlb_headshot(focus_pid, width=90)
-        with info_col:
+        # ── current at-bat MAS chip (live only) ───────────────────────────────
+        if is_live and live.get("current_batter_id") and live.get("current_pitcher_id"):
+            bat_id = live["current_batter_id"]
+            pit_id = live["current_pitcher_id"]
+            bat_name = live.get("current_batter_name", get_player_name(bat_id))
+            pit_name = live.get("current_pitcher_name", get_player_name(pit_id))
+
+            with st.spinner("Computing live MAS…"):
+                result = compute_matchup_score(bat_id, pit_id)
+
+            mas = result["mas"]
+            whiff = result["whiff_score"]
+            css_cls = mas_css_class(mas)
+            color = mas_color(mas)
+
             st.markdown(
-                f"### {focus_sp} &nbsp;"
-                f'<span style="background:{role_color};color:white;border-radius:6px;'
-                f'padding:2px 10px;font-size:0.78rem;font-weight:700">{focus_role}</span>'
-                f'&nbsp;<span style="background:{hand_color};color:white;border-radius:6px;'
-                f'padding:2px 10px;font-size:0.78rem;font-weight:700">Throws {hand}</span>',
+                f"""
+<div class="live-mas-chip">
+  <div>
+    <div class="live-mas-label">Current at-bat</div>
+    <div style="color:#fafafa;font-weight:700">{bat_name} vs {pit_name}</div>
+  </div>
+  <div>
+    <div class="live-mas-label">MAS</div>
+    <div class="live-mas-value" style="color:{color}">{mas}</div>
+  </div>
+  <div>
+    <div class="live-mas-label">Whiff Risk</div>
+    <div class="live-mas-value" style="color:#888">{whiff}</div>
+  </div>
+  <div style="flex:1">
+    <div class="mas-bar-container">
+      <div class="mas-bar-fill {css_cls}" style="width:{mas}%"></div>
+    </div>
+  </div>
+</div>
+""",
                 unsafe_allow_html=True,
             )
-            if focus_season_row:
-                st.caption(
-                    f"Season — IP: **{focus_season_row['ip']}** | "
-                    f"ERA: **{focus_season_row['era']}** | "
-                    f"WHIP: **{focus_season_row['whip']}** | "
-                    f"K: **{focus_season_row['k']}** | BB: **{focus_season_row['bb']}**"
+
+        # ── box score detail (expandable) ──────────────────────────────────────
+        with st.expander("📊 Box Score Detail", expanded=False):
+            if is_live or is_final:
+                linescore = live.get("linescore", {})
+                innings_data = linescore.get("innings", [])
+                if innings_data:
+                    innings_cols = [str(i["num"]) for i in innings_data]
+                    away_runs = [i.get("away", {}).get("runs", "") for i in innings_data]
+                    home_runs = [i.get("home", {}).get("runs", "") for i in innings_data]
+                    ls_df = pd.DataFrame(
+                        {
+                            "Team": [game["away_team"], game["home_team"]],
+                            **{
+                                col: [a, h]
+                                for col, a, h in zip(innings_cols, away_runs, home_runs)
+                            },
+                            "R": [
+                                linescore.get("teams", {}).get("away", {}).get("runs", ""),
+                                linescore.get("teams", {}).get("home", {}).get("runs", ""),
+                            ],
+                            "H": [
+                                linescore.get("teams", {}).get("away", {}).get("hits", ""),
+                                linescore.get("teams", {}).get("home", {}).get("hits", ""),
+                            ],
+                            "E": [
+                                linescore.get("teams", {}).get("away", {}).get("errors", ""),
+                                linescore.get("teams", {}).get("home", {}).get("errors", ""),
+                            ],
+                        }
+                    )
+                    st.dataframe(ls_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Linescore not yet available.")
+            else:
+                st.info("Box score will be available once the game starts.")
+
+        # ── probable pitchers / navigate to matchup ──────────────────────────
+        st.markdown("---")
+        col_away, col_home = st.columns(2)
+
+        with col_away:
+            st.markdown(f"**{game['away_team']}**")
+            away_pitcher = game.get("away_probable_pitcher", "TBD")
+            away_pitcher_id = game.get("away_probable_pitcher_id")
+            st.markdown(f"🔵 SP: {away_pitcher}")
+            if away_pitcher_id and st.button(
+                f"Analyze vs {away_pitcher}", key="btn_away_pitcher"
+            ):
+                st.session_state.selected_pitcher_id = away_pitcher_id
+                st.session_state.selected_team_id = game["home_id"]
+
+        with col_home:
+            st.markdown(f"**{game['home_team']}**")
+            home_pitcher = game.get("home_probable_pitcher", "TBD")
+            home_pitcher_id = game.get("home_probable_pitcher_id")
+            st.markdown(f"🟠 SP: {home_pitcher}")
+            if home_pitcher_id and st.button(
+                f"Analyze vs {home_pitcher}", key="btn_home_pitcher"
+            ):
+                st.session_state.selected_pitcher_id = home_pitcher_id
+                st.session_state.selected_team_id = game["away_id"]
+
+        if st.session_state.selected_pitcher_id:
+            st.success(
+                f"Pitcher selected — switch to the **🎯 Matchup** tab to see MAS scores."
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — MATCHUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_matchup:
+
+    # ── pitcher selector (compact) ────────────────────────────────────────────
+    st.markdown("#### Select Pitcher")
+
+    pitcher_search = st.text_input(
+        "Search pitcher by name",
+        placeholder="e.g. Spencer Strider",
+        key="pitcher_search",
+    )
+
+    selected_pitcher_id: int | None = st.session_state.selected_pitcher_id
+
+    if pitcher_search:
+        from core.player_lookup import search_players
+        results = search_players(pitcher_search)
+        pitchers = [r for r in results if r["position"] in ("P", "SP", "RP")]
+        if pitchers:
+            labels = [
+                f"{r['full_name']} — {r['team']}"
+                for r in pitchers
+            ]
+            chosen = st.selectbox("Match", labels, key="pitcher_search_sel")
+            chosen_idx = labels.index(chosen)
+            selected_pitcher_id = pitchers[chosen_idx]["player_id"]
+            st.session_state.selected_pitcher_id = selected_pitcher_id
+        else:
+            st.warning("No pitchers found. Try a different spelling.")
+
+    if selected_pitcher_id:
+        pitcher_info = get_player_info(selected_pitcher_id)
+        pitcher_hand = get_pitcher_handedness(selected_pitcher_id)
+
+        st.markdown(
+            f"**{pitcher_info['full_name']}** &nbsp;·&nbsp; {pitcher_info['team_name']} "
+            f"&nbsp;·&nbsp; {'LHP' if pitcher_hand == 'L' else 'RHP'}",
+        )
+
+        # ── pitcher arsenal detail (collapsible) ──────────────────────────────
+        with st.expander("📋 Pitcher Arsenal Detail", expanded=False):
+            arsenal = get_pitcher_arsenal(selected_pitcher_id)
+            if not arsenal.empty:
+                disp = arsenal[
+                    ["pitch_label", "usage_pct", "count", "avg_velocity"]
+                ].copy()
+                disp["usage_pct"] = (disp["usage_pct"] * 100).round(1).astype(str) + "%"
+                disp.columns = ["Pitch", "Usage %", "Count", "Avg Velo (mph)"]
+                st.dataframe(disp, use_container_width=True, hide_index=True)
+            else:
+                st.info("No arsenal data available.")
+
+        st.markdown("---")
+
+        # ── batter lineup source ──────────────────────────────────────────────
+        st.markdown("#### Lineup")
+        lineup_source = st.radio(
+            "Load lineup from",
+            ["Today's game", "Manual team roster", "Enter player IDs"],
+            horizontal=True,
+            key="lineup_source",
+        )
+
+        batters: list[dict] = []
+
+        if lineup_source == "Today's game":
+            if st.session_state.selected_game_pk and st.session_state.selected_team_id:
+                batters = get_game_lineup(
+                    st.session_state.selected_game_pk,
+                    st.session_state.selected_team_id,
                 )
-            if focus_today_row:
-                st.caption(
-                    f"Today — IP: **{focus_today_row['ip']}** | "
-                    f"Pitches: **{focus_today_row['pitches_thrown']}** | "
-                    f"K: **{focus_today_row['k']}** | BB: **{focus_today_row['bb']}** | "
-                    f"ER: **{focus_today_row['er']}** | H: **{focus_today_row['h']}**"
+                if not batters:
+                    st.info("Lineup not yet posted — try 'Manual team roster'.")
+            else:
+                st.info("Select a game and team in the **Today** tab first.")
+
+        elif lineup_source == "Manual team roster":
+            team_search = st.text_input("Team name or abbreviation", key="team_search_matchup")
+            if team_search:
+                from core.player_lookup import search_players
+                team_results = search_players(team_search)
+                if team_results:
+                    team_ids = list({r.get("player_id") for r in team_results})
+                    # Get team via first result's team_id
+                    first_info = get_player_info(team_results[0]["player_id"])
+                    if first_info.get("team_id"):
+                        roster = get_team_roster(first_info["team_id"])
+                        batters = [
+                            r for r in roster
+                            if r["position"] not in ("P", "SP", "RP")
+                        ]
+
+        else:  # Manual entry
+            id_input = st.text_input(
+                "Enter MLBAM player IDs, comma-separated",
+                placeholder="592450, 670541, 514888",
+                key="manual_ids_input",
+            )
+            if id_input:
+                try:
+                    ids = [int(x.strip()) for x in id_input.split(",") if x.strip()]
+                    batters = [
+                        {
+                            "player_id": pid,
+                            "name": get_player_name(pid),
+                            "position": get_player_info(pid).get("position", ""),
+                        }
+                        for pid in ids
+                    ]
+                except ValueError:
+                    st.error("Invalid player IDs — enter comma-separated integers.")
+
+        # ── compute MAS for all batters ───────────────────────────────────────
+        if batters:
+            season = date.today().year
+
+            with st.spinner(f"Computing MAS for {len(batters)} batters…"):
+                results: list[dict] = []
+                for b in batters:
+                    r = compute_matchup_score(b["player_id"], selected_pitcher_id, season)
+                    results.append(
+                        {
+                            "player_id": b["player_id"],
+                            "name": b.get("name", get_player_name(b["player_id"])),
+                            "position": b.get("position", ""),
+                            **r,
+                        }
+                    )
+
+            # ── Lineup Leverage banner ────────────────────────────────────────
+            sorted_results = sorted(results, key=lambda x: x["mas"], reverse=True)
+            top3 = sorted_results[:3]
+            bot3 = sorted_results[-3:][::-1]
+
+            top_str = " · ".join(
+                f"{r['name'].split()[-1]} ({r['mas']:.0f})" for r in top3
+            )
+            bot_str = " · ".join(
+                f"{r['name'].split()[-1]} ({r['mas']:.0f})" for r in bot3
+            )
+
+            st.markdown(
+                f"""
+<div class="leverage-banner">
+  <div class="leverage-title">⚡ LINEUP LEVERAGE</div>
+  <div class="leverage-line">🟢 Top advantages tonight: {top_str}</div>
+  <div class="leverage-line">🔴 Top risks: {bot_str}</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+            # ── headline MAS grid ─────────────────────────────────────────────
+            for r in results:
+                pid = r["player_id"]
+                mas = r["mas"]
+                whiff = r["whiff_score"]
+                vol = r["volatility"]
+                driver = r.get("primary_driver", {})
+                css_cls = mas_css_class(mas)
+                color = mas_color(mas)
+                headshot_url = get_player_headshot_url(pid)
+
+                volatile_tag = (
+                    '<span class="volatile-tag">Boom/Bust</span>'
+                    if vol > 20 else ""
                 )
-            if active_pit and active_pit.get("pitcher_id") == focus_pid:
+
+                driver_line = ""
+                if driver:
+                    pt_label = driver.get("pitch_type", "")
+                    usage = driver.get("usage_pct", 0)
+                    contrib = driver.get("contribution_pct", 0)
+                    driver_line = (
+                        f'<span class="driver-pill">'
+                        f"Driver: {pt_label} ({usage:.0f}% usage · "
+                        f"{contrib:.0f}% contribution)"
+                        f"</span>"
+                    )
+
+                pos_badge = (
+                    f'<span style="font-size:0.75rem;color:#666">'
+                    f"{r.get('position', '')} · {r['name']}</span>"
+                )
+
                 st.markdown(
-                    '<span style="background:#2ecc71;color:black;border-radius:6px;'
-                    'padding:2px 10px;font-size:0.78rem;font-weight:700">🟢 Currently on mound</span>',
+                    f"""
+<div class="mas-card">
+  <img src="{headshot_url}" width="56" height="56"
+       style="border-radius:50%;object-fit:cover;border:2px solid #2a2a2a">
+  <div class="mas-card-body">
+    <p class="mas-player-name">{r['name']}</p>
+    <p class="mas-matchup-line">
+      vs {pitcher_info['full_name']} &nbsp;({'LHP' if pitcher_hand == 'L' else 'RHP'})
+    </p>
+    <div class="mas-bar-row">
+      <div class="mas-bar-container">
+        <div class="mas-bar-fill {css_cls}" style="width:{mas}%"></div>
+      </div>
+      <span class="mas-number" style="color:{color}">{mas:.0f}</span>
+      {volatile_tag}
+    </div>
+    <div class="mas-meta-row">
+      <span class="mas-whiff-badge">Whiff Risk: {whiff:.0f}</span>
+      {driver_line}
+    </div>
+  </div>
+</div>
+""",
                     unsafe_allow_html=True,
                 )
 
-        st.markdown("---")
+                # ── dig deeper expander ───────────────────────────────────────
+                with st.expander(f"↳ Dig Deeper — {r['name']}", expanded=False):
+                    warn = r.get("sample_warnings", [])
+                    if warn:
+                        for w in warn:
+                            st.warning(w)
 
-        # ── Live pitch movement ───────────────────────────────────────────────
-        # Use pitcher_id from box score (not name-lookup) to guarantee correct filter
-        if live_id and is_active:
-            with st.spinner(f"Loading live pitches for {focus_sp}…"):
-                live_pitches = get_pitcher_live_pitches(live_id, focus_pid)
-        else:
-            live_pitches = []
-
-        if live_pitches:
-            st.markdown(
-                f'<div class="sec-hdr">Pitch Movement — Live ({len(live_pitches)} pitches)</div>',
-                unsafe_allow_html=True,
-            )
-            mv_fig = plot_pitch_movement(live_pitches, focus_sp)
-            st.plotly_chart(mv_fig, use_container_width=True)
-
-            vf_fig = plot_velocity_fade(live_pitches, focus_sp)
-            st.plotly_chart(vf_fig, use_container_width=True)
-
-            fat    = compute_pitcher_fatigue(live_pitches)
-            fg_fig = plot_fatigue_gauge(
-                fat["pitch_count"], fat["vel_drop_pct"], fat["spin_drop_pct"],
-                pitcher_name=focus_sp,
-            )
-            st.markdown('<div class="sec-hdr">Fatigue Indicator</div>', unsafe_allow_html=True)
-            fg_col, fm_col = st.columns([2, 1])
-            with fg_col:
-                st.plotly_chart(fg_fig, use_container_width=True)
-            with fm_col:
-                st.metric("Pitch Count", fat["pitch_count"])
-                st.metric("Velo Drop",   f"{fat['vel_drop_pct']:.1f}%")
-                st.metric("Spin Drop",   f"{fat['spin_drop_pct']:.1f}%")
-
-        else:
-            # No live pitches for this pitcher → show their season Statcast data
-            st.markdown(
-                '<div class="sec-hdr">Pitch Mix (Season Data)</div>',
-                unsafe_allow_html=True,
-            )
-            st.caption(
-                "No live pitches recorded for this pitcher in today's game yet. "
-                "Showing season Statcast data."
-            )
-            with st.spinner("Loading Statcast data…"):
-                import datetime as _dt
-                sc_df = fetch_statcast_csv(
-                    focus_pid, "pitcher", season=_dt.date.today().year
-                )
-
-            if not sc_df.empty and "pfx_x" in sc_df.columns:
-                season_pitches = (
-                    sc_df[sc_df["pitch_type"].notna() & sc_df["pfx_x"].notna()]
-                    .apply(lambda r: {
-                        "pitch_type":    r.get("pitch_type", ""),
-                        "pitch_name":    r.get("pitch_name", ""),
-                        "speed":         r.get("release_speed"),
-                        "pfx_x":         r.get("pfx_x"),
-                        "pfx_z":         r.get("pfx_z"),
-                        "plate_x":       r.get("plate_x"),
-                        "plate_z":       r.get("plate_z"),
-                        "spin_rate":     r.get("release_spin_rate"),
-                        "inning":        r.get("inning"),
-                        # game-break fields for velocity fade
-                        "game_pk":       r.get("game_pk"),
-                        "game_date":     r.get("game_date"),
-                        "at_bat_number": r.get("at_bat_number"),
-                        "pitch_number":  r.get("pitch_number"),
-                    }, axis=1)
-                    .tolist()
-                )
-                mv_fig = plot_pitch_movement(season_pitches, f"{focus_sp} (Season)")
-                st.plotly_chart(mv_fig, use_container_width=True)
-
-                vf_fig = plot_velocity_fade(season_pitches, f"{focus_sp} (Season)")
-                st.plotly_chart(vf_fig, use_container_width=True)
-            else:
-                st.info("No Statcast pitch data available for this pitcher yet this season.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📈 TRENDS TAB
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_trends:
-    import datetime as _dt_tr
-    _tr_season = _dt_tr.date.today().year
-
-    st.markdown(f"### Rolling Stat Trends — {sel_team}")
-
-    # ── Load team's top-5 OPS batters (season leaders) ────────────────────────
-    with st.spinner(f"Loading {sel_team} batting leaders…"):
-        batting_leaders = get_team_batting_leaders(team_id, _tr_season, n=5)
-
-    # Build name→id map from leaders + STAR_BATTERS
-    trend_id_map: dict[str, int] = {r["name"]: r["player_id"] for r in batting_leaders}
-    for name, bid in STAR_BATTERS.items():
-        if name not in trend_id_map:
-            trend_id_map[name] = bid
-
-    default_trend_batters = [r["name"] for r in batting_leaders]
-    all_trend_options     = list(trend_id_map.keys())
-
-    if batting_leaders:
-        tops = ", ".join(
-            f"{r['name']} ({r['ops']:.3f} OPS)" for r in batting_leaders
-        )
-        st.caption(f"Auto-selected top-5 OPS leaders: {tops}")
-
-    trend_batters = st.multiselect(
-        "Select Batters",
-        all_trend_options,
-        default=default_trend_batters,
-        key=f"trend_batters_{team_id}",
-    )
-
-    # ── Opposing pitcher selector ──────────────────────────────────────────────
-    opp_prob = ""
-    if live_s:
-        opp_prob = (
-            live_s.get("away_probable_pitcher", "")
-            if live_s["home_id"] == team_id
-            else live_s.get("home_probable_pitcher", "")
-        ) or ""
-
-    trend_pitcher    = st.text_input(
-        "Opposing Pitcher (for K-Rate comparison)",
-        value=opp_prob,
-        key=f"trend_pitcher_{team_id}",
-    )
-    trend_pitcher_id = lookup_player_id(trend_pitcher) if trend_pitcher else None
-
-    # ── League avg K% (fetched once per season) ───────────────────────────────
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def _lg_krate(season: int) -> float:
-        return get_league_avg_krate(season)
-
-    lg_kpct = _lg_krate(_tr_season)
-    # MLB avg pitcher K/9 (2023-2025 ~8.5); use as reference on pitcher axis
-    LG_AVG_K9 = 8.5
-
-    # ── Per-batter expanders ───────────────────────────────────────────────────
-    for bname in trend_batters:
-        bid = trend_id_map.get(bname) or lookup_player_id(bname)
-        if not bid:
-            continue
-
-        with st.expander(bname, expanded=(bname == trend_batters[0])):
-            hs_c, nm_c = st.columns([1, 6])
-            with hs_c:
-                _show_mlb_headshot(bid, width=65)
-            with nm_c:
-                leader_row = next((r for r in batting_leaders if r["player_id"] == bid), None)
-                if leader_row:
-                    st.markdown(
-                        f"**{bname}** — OPS: **{leader_row['ops']:.3f}** | "
-                        f"AVG: **{leader_row['avg']}** | HR: **{leader_row['hr']}**"
+                    dig_tab1, dig_tab2, dig_tab3, dig_tab4 = st.tabs(
+                        ["Per-Pitch Breakdown", "Hot Zone", "Career Splits", "Pitch Mix Simulator"]
                     )
-                else:
-                    st.markdown(f"**{bname}**")
 
-            with st.spinner(f"Loading stats for {bname}…"):
-                b_log     = get_batter_game_log(bid)
-                barrel_df = get_barrel_trend(bid, n_games=15)
+                    with dig_tab1:
+                        per_pitch_df = r.get("per_pitch_breakdown", pd.DataFrame())
+                        if not per_pitch_df.empty:
+                            st.plotly_chart(
+                                plot_per_pitch_breakdown(per_pitch_df),
+                                use_container_width=True,
+                                key=f"breakdown_{pid}",
+                            )
+                        else:
+                            st.info("No per-pitch data.")
 
-            c1, c2 = st.columns(2)
-            with c1:
-                ops_fig = plot_rolling_ops(b_log, bname)
-                st.plotly_chart(ops_fig, use_container_width=True)
-            with c2:
-                brl_fig = plot_barrel_trend(barrel_df, bname)
-                st.plotly_chart(brl_fig, use_container_width=True)
+                    with dig_tab2:
+                        st.plotly_chart(
+                            plot_hot_zone_grid(pid, season),
+                            use_container_width=True,
+                            key=f"hotzone_{pid}",
+                        )
 
-            # K-rate chart with league averages
-            p_log = get_pitcher_game_log(trend_pitcher_id) if trend_pitcher_id else []
-            krate_fig = plot_krate_chart(
-                b_log, p_log, bname, trend_pitcher or "—",
-                league_avg_kpct=lg_kpct,
-                league_avg_k9=LG_AVG_K9 if p_log else None,
-            )
-            st.plotly_chart(krate_fig, use_container_width=True)
+                    with dig_tab3:
+                        st.plotly_chart(
+                            plot_career_pitch_splits(pid, season),
+                            use_container_width=True,
+                            key=f"splits_{pid}",
+                        )
 
+                    with dig_tab4:
+                        show_pitch_mix_simulator(
+                            selected_pitcher_id, pid, season
+                        )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📋 LAST 3 GAMES TAB
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_l3:
-    with st.spinner("Loading last 3 games…"):
-        past_games = get_last_n_completed_games(team_id, n=3)
+        elif lineup_source != "Today's game":
+            st.info("Add batters above to compute MAS scores.")
 
-    if not past_games:
-        st.info("No completed games found.")
     else:
-        for g_past in reversed(past_games):
-            sp = get_game_summary(g_past)
-            won = ((sp["home_id"] == team_id and sp["home_score"] > sp["away_score"]) or
-                   (sp["away_id"] == team_id and sp["away_score"] > sp["home_score"]))
-            result = "W" if won else "L"
-            with st.expander(
-                f"**{result}**  {sp['away_name']} {sp['away_score']} — "
-                f"{sp['home_score']} {sp['home_name']}  ·  {sp.get('game_date','')}",
-                expanded=False,
-            ):
-                try:
-                    bx = get_live_box_score(sp["game_id"])
-                    ls = get_linescore(sp["game_id"])
-                    inn_df = build_inning_table(ls)
-                    if not inn_df.empty:
-                        ta = ls.get("teams",{}).get("away",{})
-                        th = ls.get("teams",{}).get("home",{})
-                        hdrs   = ["Team"] + [str(r) for r in inn_df["Inning"]] + ["R","H","E"]
-                        away_r = [sp["away_name"]] + list(inn_df["Away"]) + [
-                            ta.get("runs",0),ta.get("hits",0),ta.get("errors",0)]
-                        home_r = [sp["home_name"]] + list(inn_df["Home"]) + [
-                            th.get("runs",0),th.get("hits",0),th.get("errors",0)]
-                        st.dataframe(pd.DataFrame([away_r,home_r],columns=hdrs),
-                                     use_container_width=True,hide_index=True)
-
-                    ts2  = "home" if sp["home_id"] == team_id else "away"
-                    os2  = "away" if ts2 == "home" else "home"
-                    on2  = sp["away_name"] if ts2 == "home" else sp["home_name"]
-
-                    bb1,bb2 = st.tabs([f"{sel_team} Batting", f"{on2} Batting"])
-                    with bb1:
-                        df = build_batting_table(bx, ts2)
-                        if not df.empty:
-                            st.dataframe(df, use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("No data.")
-                    with bb2:
-                        df = build_batting_table(bx, os2)
-                        if not df.empty:
-                            st.dataframe(df, use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("No data.")
-
-                    pb1, pb2 = st.tabs([f"{sel_team} Pitching", f"{on2} Pitching"])
-                    with pb1:
-                        df = build_pitching_table(bx, ts2)
-                        if not df.empty:
-                            st.dataframe(df, use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("No data.")
-                    with pb2:
-                        df = build_pitching_table(bx, os2)
-                        if not df.empty:
-                            st.dataframe(df, use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("No data.")
-                except Exception as e:
-                    st.warning(f"Could not load box score: {e}")
+        st.info(
+            "Search for a pitcher above, or select one from the **Today** tab."
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 📊 L3 STATS TAB
+# TAB 3 — TRENDS
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_stats:
-    with st.spinner("Aggregating last 3 games…"):
-        past3 = get_last_n_completed_games(team_id, n=3)
 
-    if not past3:
-        st.info("No completed games to aggregate.")
-    else:
-        gids  = [g["game_id"] for g in past3]
-        dates = " · ".join(g.get("game_date","") for g in past3)
-        st.caption(f"Games: {dates}")
+with tab_trends:
+    st.markdown("### MAS Trend — Batter over Time")
+    st.info(
+        "Coming soon: track how a batter's MAS vs a specific pitcher evolves across "
+        "a rolling 30-day window as the pitcher's arsenal usage shifts."
+    )
 
-        c_bat, c_pit = st.columns(2)
-        with c_bat:
-            st.markdown('<div class="sec-hdr">Batting — L3</div>', unsafe_allow_html=True)
-            with st.spinner():
-                bat_df = aggregate_batting_stats(gids, team_id)
-            if not bat_df.empty:
-                st.dataframe(bat_df, use_container_width=True, hide_index=True)
+    st.markdown("---")
+    st.markdown("### League Pitch Baseline Trends")
+    st.info(
+        "Coming soon: chart how barrel_rate_mean and whiff_rate_mean for each "
+        "pitch type move across the season — contextualizes whether a MAS of 65 "
+        "means the same thing in April vs September."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — HISTORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_history:
+    st.markdown("### Last 3 Games — Batter Performance")
+
+    batter_hist_search = st.text_input(
+        "Search batter", placeholder="e.g. Yordan Alvarez", key="hist_batter_search"
+    )
+
+    if batter_hist_search:
+        from core.player_lookup import search_players
+        hist_results = search_players(batter_hist_search)
+        non_pitchers = [r for r in hist_results if r["position"] not in ("P", "SP", "RP")]
+
+        if non_pitchers:
+            hist_labels = [f"{r['full_name']} — {r['team']}" for r in non_pitchers]
+            hist_chosen = st.selectbox("Select batter", hist_labels, key="hist_batter_sel")
+            hist_idx = hist_labels.index(hist_chosen)
+            hist_batter_id = non_pitchers[hist_idx]["player_id"]
+
+            season = date.today().year
+            splits = None
+            try:
+                from mlb_season.pipeline import get_batter_pitch_splits
+                splits = get_batter_pitch_splits(hist_batter_id, season)
+            except Exception:
+                pass
+
+            if splits is not None and not splits.empty:
+                st.markdown("#### Season Pitch-Type Splits (vs LHP / RHP)")
+                disp = splits[[
+                    "pitch_label", "vs_hand", "barrel_rate", "whiff_rate", "sample_size"
+                ]].copy()
+                disp["barrel_rate"] = (disp["barrel_rate"] * 100).round(2).astype(str) + "%"
+                disp["whiff_rate"] = (disp["whiff_rate"] * 100).round(2).astype(str) + "%"
+                disp.columns = ["Pitch", "vs Hand", "Barrel %", "Whiff %", "Pitches Seen"]
+                st.dataframe(disp, use_container_width=True, hide_index=True)
+
+                st.markdown("#### Career Pitch Splits Chart")
+                st.plotly_chart(
+                    plot_career_pitch_splits(hist_batter_id, season),
+                    use_container_width=True,
+                    key="hist_career_splits",
+                )
             else:
-                st.caption("No data.")
-        with c_pit:
-            st.markdown('<div class="sec-hdr">Pitching — L3</div>', unsafe_allow_html=True)
-            with st.spinner():
-                pit_df = aggregate_pitching_stats(gids, team_id)
-            if not pit_df.empty:
-                st.dataframe(pit_df, use_container_width=True, hide_index=True)
+                st.info("No split data found for this batter this season.")
+        else:
+            st.warning("No position players found. Try a different name.")
+
+    st.markdown("---")
+    st.markdown("### Last 3 Starts — Pitcher Breakdown")
+    pitcher_hist_search = st.text_input(
+        "Search pitcher", placeholder="e.g. Gerrit Cole", key="hist_pitcher_search"
+    )
+    if pitcher_hist_search:
+        from core.player_lookup import search_players
+        pit_results = search_players(pitcher_hist_search)
+        pitchers = [r for r in pit_results if r["position"] in ("P", "SP", "RP")]
+
+        if pitchers:
+            pit_labels = [f"{r['full_name']} — {r['team']}" for r in pitchers]
+            pit_chosen = st.selectbox("Select pitcher", pit_labels, key="hist_pitcher_sel")
+            pit_idx = pit_labels.index(pit_chosen)
+            hist_pitcher_id = pitchers[pit_idx]["player_id"]
+
+            season = date.today().year
+            arsenal = get_pitcher_arsenal(hist_pitcher_id, season)
+            if not arsenal.empty:
+                st.markdown("#### Season Arsenal")
+                disp = arsenal[["pitch_label", "usage_pct", "count", "avg_velocity"]].copy()
+                disp["usage_pct"] = (disp["usage_pct"] * 100).round(1).astype(str) + "%"
+                disp.columns = ["Pitch", "Usage %", "Count", "Avg Velo (mph)"]
+                st.dataframe(disp, use_container_width=True, hide_index=True)
             else:
-                st.caption("No data.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🔮 UP NEXT TAB
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_next:
-    with st.spinner("Loading upcoming game…"):
-        next_game = get_upcoming_game(team_id)
-
-    if not next_game:
-        st.info("No upcoming game found in next 7 days.")
-    else:
-        ns = get_game_summary(next_game)
-        try:
-            dt  = datetime.fromisoformat(ns["game_datetime"].replace("Z","+00:00")).astimezone(CT)
-            gts = dt.strftime("%A, %B %-d  ·  %-I:%M %p CT")
-        except Exception:
-            gts = ns.get("game_date","")
-
-        st.markdown(f"### {ns['away_name']} @ {ns['home_name']}")
-        st.markdown(f"**{gts}**  ·  {ns['venue']}")
-        st.markdown("---")
-
-        sp1, sp2 = st.columns(2)
-        sp1.metric(f"{ns['away_name']} SP", ns["away_probable_pitcher"])
-        sp2.metric(f"{ns['home_name']} SP", ns["home_probable_pitcher"])
-
-        st.markdown("---")
-
-        try:
-            ub = get_live_box_score(ns["game_id"])
-        except Exception:
-            ub = {}
-
-        nc1, nc2 = st.columns(2)
-        with nc1:
-            _lineup_col(ub, "away", ns["away_id"], ns["away_name"])
-        with nc2:
-            _lineup_col(ub, "home", ns["home_id"], ns["home_name"])
-
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.caption("Data: MLB Stats API · Baseball Savant Statcast · "
-           "Use 🔄 Refresh to update · Lineup projections from last 5 games")
+                st.info("No arsenal data found.")
+        else:
+            st.warning("No pitchers found.")
