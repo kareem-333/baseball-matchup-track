@@ -137,8 +137,15 @@ def build_inning_table(linescore: dict) -> pd.DataFrame:
     rows = [{"Inning": i.get("num"),
              "Away": i.get("away", {}).get("runs", "-"),
              "Home": i.get("home", {}).get("runs", "-")} for i in innings]
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Inning", "Away", "Home"])
-
+    if not rows:
+        return pd.DataFrame(columns=["Inning", "Away", "Home"])
+    df = pd.DataFrame(rows)
+    # PyArrow (used by Streamlit Cloud) cannot mix strings and ints in one column.
+    # Cast Away and Home to string so '-' placeholders don't cause type conflicts.
+    df["Away"] = df["Away"].astype(str)
+    df["Home"] = df["Home"].astype(str)
+    df["Inning"] = df["Inning"].astype(str)
+    return df
 
 def build_batting_table(box: dict, side: str) -> pd.DataFrame:
     team_data = box.get(side, {})
