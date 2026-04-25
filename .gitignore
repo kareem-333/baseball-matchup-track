@@ -9,3 +9,7 @@ dist/
 .venv/
 venv/
 .streamlit/secrets.toml
+data/raw/
+data/interim/
+data/processed/
+.pytest_cache/
