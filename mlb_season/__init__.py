@@ -1,10 +1,12 @@
 """
-mlb_season — Season-level MLB stats pipeline and chart builders.
+mlb_season — Season-level MLB stats pipeline.
 
 Covers: Statcast CSV pulls, pitch arsenal, batter splits, hot zones,
 barrel trends, OPS/K-rate game logs, lineup prediction, team rosters,
 pitching staff rankings, batting leaders, league averages, and
 multi-season career pitch-type split analysis.
+
+Charts have moved to dashboard/components/season_charts.py.
 """
 
 from mlb_season.pipeline import (
@@ -26,17 +28,6 @@ from mlb_season.pipeline import (
     get_league_avg_krate,
     get_lineup_with_ids,
 )
-from mlb_season.charts import (
-    plot_matchup_heatmap,
-    plot_hot_zone_grid,
-    plot_rolling_ops,
-    plot_krate_chart,
-    plot_barrel_trend,
-    show_pitch_mix_simulator,
-    plot_career_pitch_splits,
-    plot_pitch_type_season_trend,
-    plot_career_splits_table_fig,
-)
 
 __all__ = [
     "fetch_statcast_csv", "fetch_statcast_multi_season",
@@ -48,9 +39,4 @@ __all__ = [
     "aggregate_batting_stats", "aggregate_pitching_stats",
     "get_team_pitching_staff", "get_team_batting_leaders",
     "get_league_avg_krate", "get_lineup_with_ids",
-    "plot_matchup_heatmap", "plot_hot_zone_grid",
-    "plot_rolling_ops", "plot_krate_chart",
-    "plot_barrel_trend", "show_pitch_mix_simulator",
-    "plot_career_pitch_splits", "plot_pitch_type_season_trend",
-    "plot_career_splits_table_fig",
 ]
