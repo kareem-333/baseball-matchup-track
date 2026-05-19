@@ -1,7 +1,3 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(__file__))
-
 """
 Baseball Matchup Tracker — Streamlit Dashboard
 Five tabs: Live · Matchup · Pitching · Trends · Last 3
@@ -12,6 +8,10 @@ Statcast data   →  mlb_season/pipeline.py (Baseball Savant CSV, cached)
 """
 
 from __future__ import annotations
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
 
 from datetime import date
 
