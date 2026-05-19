@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+
 """
 Baseball Matchup Tracker — Streamlit Dashboard
 Five tabs: Live · Matchup · Pitching · Trends · Last 3
